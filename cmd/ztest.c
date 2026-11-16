@@ -270,6 +270,7 @@ extern uint64_t zfs_deadman_synctime_ms;
 extern uint_t metaslab_preload_limit;
 extern int zfs_compressed_arc_enabled;
 extern int zfs_abd_scatter_enabled;
+extern uint_t zfs_arc_presaged_max_percent;
 extern uint_t dmu_object_alloc_chunk_shift;
 extern boolean_t zfs_force_some_double_word_sm_entries;
 extern unsigned long zfs_reconstruct_indirect_damage_fraction;
@@ -452,6 +453,7 @@ ztest_func_t ztest_blake3;
 ztest_func_t ztest_fletcher;
 ztest_func_t ztest_fletcher_incr;
 ztest_func_t ztest_verify_dnode_bt;
+ztest_func_t ztest_presage;
 ztest_func_t ztest_pool_prefetch_ddt;
 ztest_func_t ztest_ddt_prune;
 ztest_func_t ztest_spa_log_flushall_start;
@@ -508,6 +510,7 @@ static ztest_info_t ztest_info[] = {
 	ZTI_INIT(ztest_fletcher, 1, &zopt_rarely),
 	ZTI_INIT(ztest_fletcher_incr, 1, &zopt_rarely),
 	ZTI_INIT(ztest_verify_dnode_bt, 1, &zopt_sometimes),
+	ZTI_INIT(ztest_presage, 1, &zopt_sometimes),
 	ZTI_INIT(ztest_pool_prefetch_ddt, 1, &zopt_rarely),
 	ZTI_INIT(ztest_ddt_prune, 1, &zopt_rarely),
 	ZTI_INIT(ztest_spa_log_flushall_start, 1, &zopt_rarely),
@@ -6393,6 +6396,102 @@ ztest_verify_dnode_bt(ztest_ds_t *zd, uint64_t id)
 	}
 }
 
+/*
+ * Presage: ask the ARC to keep a random range of a random object resident
+ * for a short TTL (sometimes the whole object; sometimes release or just
+ * report instead), so the mark, load, cap, expiry and demotion paths run
+ * under the object destroy, rewrite and export churn of the other tests.
+ * Only dmu_presage() is reachable from libzpool; reservations and the
+ * reaper thread are kernel-only.
+ */
+static struct {
+	uint64_t	zp_calls;
+	uint64_t	zp_ok;
+	uint64_t	zp_enoent;
+	uint64_t	zp_enospc;
+	uint64_t	zp_other;
+	uint64_t	zp_pinned;
+} ztest_presage_stats;
+
+#define	ZTEST_PRESAGE_MAX_LEN	(16ULL << 20)
+
+void
+ztest_presage(ztest_ds_t *zd, uint64_t id)
+{
+	(void) id;
+	objset_t *os = zd->zd_os;
+	dmu_object_info_t doi;
+	uint64_t object, offset, len, pinned, cached, uncached;
+	uint32_t ttl = 2 + ztest_random(9);	/* 2..10 s */
+	uint32_t flags = 0;
+	int err;
+
+	/* The first allocated object at or after a random object number. */
+	object = ztest_random(256);
+	if (dmu_object_next(os, &object, B_FALSE, 0) != 0)
+		return;
+	if (dmu_object_info(os, object, &doi) != 0)
+		return;
+
+	/*
+	 * ztest objects can be sparse over terabytes and the load walks
+	 * every L0 block of the range, holes included, so bound the range.
+	 */
+	if (doi.doi_max_offset == 0 || ztest_random(4) == 0) {
+		offset = 0;
+		len = MAX(doi.doi_max_offset, doi.doi_data_block_size);
+	} else {
+		offset = ztest_random(doi.doi_max_offset);
+		len = 1 + ztest_random(doi.doi_max_offset - offset);
+	}
+	len = MIN(len, ZTEST_PRESAGE_MAX_LEN);
+
+	switch (ztest_random(8)) {
+	case 0:
+		flags = ZFS_PRESAGE_RELEASE;
+		break;
+	case 1:
+		flags = ZFS_PRESAGE_STATUS;
+		break;
+	}
+
+	err = dmu_presage(os, object, offset, len, arc_presage_deadline(ttl),
+	    flags, &pinned, &cached, &uncached);
+
+	atomic_inc_64(&ztest_presage_stats.zp_calls);
+	switch (err) {
+	case 0:
+		atomic_inc_64(&ztest_presage_stats.zp_ok);
+		atomic_add_64(&ztest_presage_stats.zp_pinned, pinned);
+		break;
+	case ENOENT:
+	case ENOTSUP:
+	case EBUSY:
+	case EINTR:
+		atomic_inc_64(&ztest_presage_stats.zp_enoent);
+		break;
+	case ENOSPC:
+		atomic_inc_64(&ztest_presage_stats.zp_enospc);
+		break;
+	default:
+		atomic_inc_64(&ztest_presage_stats.zp_other);
+		fatal(B_FALSE, "dmu_presage(%s, %"PRIu64", %"PRIu64", "
+		    "%"PRIu64", ttl %u, flags %u) = %d", zd->zd_name,
+		    object, offset, len, ttl, flags, err);
+	}
+
+	zfs_dbgmsg("ztest_presage %s obj %llu off %llu len %llu ttl %u "
+	    "flags %u = %d pinned %llu cached %llu uncached %llu "
+	    "[calls %llu ok %llu enoent %llu enospc %llu]",
+	    zd->zd_name, (u_longlong_t)object, (u_longlong_t)offset,
+	    (u_longlong_t)len, ttl, flags, err, (u_longlong_t)pinned,
+	    (u_longlong_t)cached, (u_longlong_t)uncached,
+	    (u_longlong_t)ztest_presage_stats.zp_calls,
+	    (u_longlong_t)ztest_presage_stats.zp_ok,
+	    (u_longlong_t)ztest_presage_stats.zp_enoent,
+	    (u_longlong_t)ztest_presage_stats.zp_enospc);
+}
+
 void
 ztest_spa_log_flushall_start(ztest_ds_t *zd, uint64_t id)
 {
@@ -9579,6 +9678,12 @@ main(int argc, char **argv)
 		memcpy(&ztest_opts, ztest_shared_opts, sizeof (ztest_opts));
 	}
 	ASSERT3U(ztest_opts.zo_datasets, ==, ztest_shared_hdr->zh_ds_count);
+
+	/*
+	 * Turn the presage ARC state on so ztest_presage() exercises it;
+	 * a -o option below may still override this.
+	 */
+	zfs_arc_presaged_max_percent = 25;
 
 	err = ztest_set_global_vars();
 	if (err != 0 && !fd_data_str) {

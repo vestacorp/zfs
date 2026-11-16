@@ -999,6 +999,59 @@ nobase_dist_datadir_zfs_tests_tests_SCRIPTS += \
 	functional/cli_root/zfs_reservation/setup.ksh \
 	functional/cli_root/zfs_reservation/zfs_reservation_001_pos.ksh \
 	functional/cli_root/zfs_reservation/zfs_reservation_002_pos.ksh \
+	functional/cli_root/zfs_presage/cleanup.ksh \
+	functional/cli_root/zfs_presage/setup.ksh \
+	functional/cli_root/zfs_presage/zfs_presage.kshlib \
+	functional/cli_root/zfs_presage/zfs_presage_001_pos.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_002_ttl.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_003_cap.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_004_neg.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_005_export.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_006_future.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_007_kill_pending.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_008_written_during.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_009_gone.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_010_held_expiry.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_011_zvol_basic.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_012_zvol_destroy.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_013_zvol_rename.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_014_zvol_neg.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_015_sparse.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_016_zvol_edge.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_017_abi.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_018_rewrite.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_019_recv_force.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_020_rewrite_uncached.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_021_rollback.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_022_snapshot_rewrite.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_023_recv_incremental.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_024_zcp_rollback.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_025_rollback_load.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_026_resweep_sync.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_027_expire_held.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_028_zvol_encrypted.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_029_replace_sibling.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_030_kill_load.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_031_unmount.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_032_disable.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_033_free_snapshot.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_034_replace_future.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_035_snapshot_indirect.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_036_kill_rewrite.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_037_sync_rewrite_snapshot.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_038_sync_rewrite_inherit.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_039_kill_nothing.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_040_cap_copies.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_041_reap_idle.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_042_nopwrite.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_043_flush_ghost.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_044_cap_ceiling.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_050_restore_idle.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_051_export_refused.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_052_request_restoring.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_053_fenced_status.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_060_bad_args.ksh \
+	functional/cli_root/zfs_presage/zfs_presage_061_old_module_stats.ksh \
 	functional/cli_root/zfs_rewrite/cleanup.ksh \
 	functional/cli_root/zfs_rewrite/setup.ksh \
 	functional/cli_root/zfs_rewrite/zfs_rewrite.ksh \

@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: CDDL-1.0
+#
+# This file and its contents are supplied under the terms of the
+# Common Development and Distribution License ("CDDL"), version 1.0.
+# You may only use this file in accordance with the terms of version
+# 1.0 of the CDDL.
+#
+# A full copy of the text of the CDDL should have accompanied this
+# source.  A copy of the CDDL is also available via the Internet at
+# https://opensource.org/license/CDDL-1.0.
+#
+# Copyright (c) 2026, Vesta Corporation.
+# Copyright (c) 2026, Todd Curry.
+. $STF_SUITE/include/libtest.shlib
+
+# "zfs presage status -p FILE" prints:
+# FILE presaged N cached N uncached N pending N warmed T expires T
+# A volume name works in place of FILE.
+function presaged_bytes # file
+{
+	zfs presage status -p $1 | awk '{print $3}'
+}
+function cached_bytes # file
+{
+	zfs presage status -p $1 | awk '{print $5}'
+}
+function pending_count # file
+{
+	zfs presage status -p $1 | awk '{print $9}'
+}
+function warmed_at # file
+{
+	zfs presage status -p $1 | awk '{print $11}'
+}
+function expires_at # file
+{
+	zfs presage status -p $1 | awk '{print $13}'
+}
+function presaged_size
+{
+	kstat arcstats.presaged_size
+}
+
+# Wait up to 15 s for presage to hold at most $1 reservations and to have
+# no load and no dataset hold in flight.  A reservation on a destroyed
+# dataset cancels at its next sweep (within 5 s), so a test takes its
+# baseline at the start and waits for it here rather than asserting at
+# once.
+function presage_wait_clean # max_reservations
+{
+	typeset -i i
+	for ((i = 0; i < 75; i++)); do
+		[[ $(kstat presage.reservations) -le $1 &&
+		    $(kstat presage.loads) -eq 0 &&
+		    $(kstat presage.holds) -eq 0 ]] && return 0
+		sleep 0.2
+	done
+	log_fail "presage not clean: reservations=$(kstat presage.reservations)" \
+	    "(max $1) loads=$(kstat presage.loads) holds=$(kstat presage.holds)"
+}
+
+# Wait up to $2 s (default 90) for presaged_size to fall to at most $1
+# bytes.  Blocks a rollback or receive -F orphaned stay presaged until
+# the async destroy frees them; a test that made such blocks waits here
+# before the next test asks for cap room.
+function presage_wait_settled # max_bytes [seconds]
+{
+	typeset -i i n=$((${2:-90} * 2))
+	for ((i = 0; i < n; i++)); do
+		[[ $(presaged_size) -le $1 ]] && return 0
+		sleep 0.5
+	done
+	log_fail "presaged_size $(presaged_size) still above $1 after" \
+	    "${2:-90} s"
+}
+
+# Shrink the ARC so a few hundred MiB of streaming evicts things.  zfs_arc_max
+# is ignored unless it is above zfs_arc_min, so lower the minimum first.
+function arc_small # max_bytes
+{
+	log_must set_tunable64 ARC_MIN $((32 * 1024 * 1024))
+	log_must set_tunable64 ARC_MAX $1
+}
+# Hold the ARC target at exactly $1 bytes, so the presage cap (a share of
+# the target) is known.  From any starting point: lower the minimum, set
+# the maximum, raise the minimum to meet it.
+function arc_fixed # bytes
+{
+	log_must set_tunable64 ARC_MIN $((32 * 1024 * 1024))
+	log_must set_tunable64 ARC_MAX $1
+	log_must set_tunable64 ARC_MIN $1
+}
+# Writing 0 to zfs_arc_min or zfs_arc_max does not bring the defaults back
+# (arc_tuning_update() ignores 0), so the limits in force are read from
+# arcstats before a test changes them and written back explicitly after.
+# The maximum has to stay above the minimum at every step, so whichever of
+# the two leaves room is moved first.
+function arc_restore
+{
+	if [[ -n $PRESAGE_ARC_C_MAX && -n $PRESAGE_ARC_C_MIN ]]; then
+		if [[ $PRESAGE_ARC_C_MAX -gt $(kstat arcstats.c_min) ]]; then
+			set_tunable64 ARC_MAX $PRESAGE_ARC_C_MAX
+			set_tunable64 ARC_MIN $PRESAGE_ARC_C_MIN
+		else
+			set_tunable64 ARC_MIN $PRESAGE_ARC_C_MIN
+			set_tunable64 ARC_MAX $PRESAGE_ARC_C_MAX
+		fi >/dev/null 2>&1
+	fi
+	restore_tunable ARC_MAX
+	restore_tunable ARC_MIN
+}
+function arc_save
+{
+	save_tunable ARC_MIN
+	save_tunable ARC_MAX
+	PRESAGE_ARC_C_MIN=$(kstat arcstats.c_min)
+	PRESAGE_ARC_C_MAX=$(kstat arcstats.c_max)
+}
+
+# The block device of a volume, for tests that must write data into it.
+# /dev/zvol/<name> needs the udev rules, which a box running from the build
+# tree may not have; the kernel still creates /dev/zdN on Linux, and
+# zvol_id maps a /dev/zdN back to its volume name.  Prints nothing when no
+# device can be found; callers log_unsupported then.
+function presage_zvol_dev # volume
+{
+	typeset vol=$1 dev zid
+
+	if [[ -e $ZVOL_DEVDIR/$vol ]]; then
+		echo $ZVOL_DEVDIR/$vol
+		return
+	fi
+	is_linux || return
+	for zid in $STF_SUITE/../../udev/zvol_id /lib/udev/zvol_id \
+	    /usr/lib/udev/zvol_id; do
+		[[ -x $zid ]] && break
+	done
+	[[ -x $zid ]] || return
+	for dev in /dev/zd*; do
+		[[ -b $dev ]] || continue
+		if [[ "$($zid $dev 2>/dev/null)" == "$vol" ]]; then
+			echo $dev
+			return
+		fi
+	done
+}

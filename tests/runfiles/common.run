@@ -343,6 +343,34 @@ tests = ['zfs_rewrite', 'zfs_rewrite_dedup_birth', 'zfs_rewrite_physical',
     'zfs_rewrite_skip_width']
 tags = ['functional', 'cli_root', 'zfs_rewrite']
 
+[tests/functional/cli_root/zfs_presage]
+tests = ['zfs_presage_001_pos', 'zfs_presage_002_ttl', 'zfs_presage_003_cap',
+    'zfs_presage_004_neg', 'zfs_presage_005_export', 'zfs_presage_006_future',
+    'zfs_presage_007_kill_pending', 'zfs_presage_008_written_during',
+    'zfs_presage_009_gone', 'zfs_presage_010_held_expiry',
+    'zfs_presage_011_zvol_basic', 'zfs_presage_012_zvol_destroy',
+    'zfs_presage_013_zvol_rename', 'zfs_presage_014_zvol_neg',
+    'zfs_presage_015_sparse', 'zfs_presage_016_zvol_edge',
+    'zfs_presage_017_abi', 'zfs_presage_018_rewrite',
+    'zfs_presage_019_recv_force', 'zfs_presage_020_rewrite_uncached',
+    'zfs_presage_021_rollback', 'zfs_presage_022_snapshot_rewrite',
+    'zfs_presage_023_recv_incremental', 'zfs_presage_024_zcp_rollback',
+    'zfs_presage_025_rollback_load', 'zfs_presage_026_resweep_sync',
+    'zfs_presage_027_expire_held', 'zfs_presage_028_zvol_encrypted',
+    'zfs_presage_029_replace_sibling', 'zfs_presage_030_kill_load',
+    'zfs_presage_031_unmount', 'zfs_presage_032_disable',
+    'zfs_presage_033_free_snapshot', 'zfs_presage_034_replace_future',
+    'zfs_presage_035_snapshot_indirect', 'zfs_presage_036_kill_rewrite',
+    'zfs_presage_037_sync_rewrite_snapshot',
+    'zfs_presage_038_sync_rewrite_inherit', 'zfs_presage_039_kill_nothing',
+    'zfs_presage_040_cap_copies', 'zfs_presage_041_reap_idle',
+    'zfs_presage_042_nopwrite', 'zfs_presage_043_flush_ghost',
+    'zfs_presage_044_cap_ceiling', 'zfs_presage_050_restore_idle',
+    'zfs_presage_051_export_refused', 'zfs_presage_052_request_restoring',
+    'zfs_presage_053_fenced_status',
+    'zfs_presage_060_bad_args', 'zfs_presage_061_old_module_stats']
+tags = ['functional', 'cli_root', 'zfs_presage']
+
 [tests/functional/cli_root/zfs_rollback]
 tests = ['zfs_rollback_001_pos', 'zfs_rollback_002_pos',
     'zfs_rollback_003_neg', 'zfs_rollback_004_neg']
