@@ -111,6 +111,7 @@ cols = {
     "mfug":       [4, 1000, "MFU ghost list hits per second"],
     "mrug":       [4, 1000, "MRU ghost list hits per second"],
     "unc":        [4, 1000, "Uncached list hits per second"],
+    "psg":        [4, 1000, "Presaged list hits per second"],
     "eskip":      [5, 1000, "evict_skip per second"],
     "el2skip":    [7, 1000, "evict skip, due to l2 writes, per second"],
     "el2cach":    [7, 1024, "Size of L2 cached evictions per second"],
@@ -194,6 +195,7 @@ statefields = {
     "mfu":      ["mfu", "MFU"],
     "mru":      ["mru", "MRU"],
     "unc":      ["uncached", "Uncached"],
+    "psg":      ["presaged", "Presaged"],
 }
 targetstats = {
     "percent":  "cachessz",                 # percentage of this value
@@ -359,7 +361,8 @@ def snap_stats():
     # fill in additional values from zarcsummary
     cur["caches_size"] = caches_size = cur["anon_data"]+cur["anon_metadata"]+\
         cur["mfu_data"]+cur["mfu_metadata"]+cur["mru_data"]+cur["mru_metadata"]+\
-        cur["uncached_data"]+cur["uncached_metadata"]
+        cur["uncached_data"]+cur["uncached_metadata"]+\
+        cur.get("presaged_data", 0)+cur.get("presaged_metadata", 0)
     s = 4294967296
     pd = cur["pd"]
     pm = cur["pm"]
@@ -688,6 +691,7 @@ def calculate():
     v["mrug"] = d["mru_ghost_hits"] / sint
     v["mfug"] = d["mfu_ghost_hits"] / sint
     v["unc"] = d["uncached_hits"] / sint
+    v["psg"] = d.get("presaged_hits", 0) / sint
     v["eskip"] = d["evict_skip"] / sint
     v["el2skip"] = d["evict_l2_skip"] / sint
     v["el2cach"] = d["evict_l2_cached"] / sint
@@ -719,7 +723,9 @@ def calculate():
                         ("fields" in group and field not in group["fields"]):
                         continue
                     colname = field + stat
-                    v[colname] = cur[fieldval[0] + statval[0]]
+                    # A module older than this tool lacks some states
+                    # (presaged); report them as empty.
+                    v[colname] = cur.get(fieldval[0] + statval[0], 0)
                     if "percent" in group:
                         v[colname + "%"] = 100 * v[colname] / \
                             v[group["percent"]] if v[group["percent"]] > 0 else 0

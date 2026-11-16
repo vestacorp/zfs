@@ -1,0 +1,294 @@
+.\" SPDX-License-Identifier: CDDL-1.0
+.\"
+.\" This file and its contents are supplied under the terms of the
+.\" Common Development and Distribution License ("CDDL"), version 1.0.
+.\" You may only use this file in accordance with the terms of version
+.\" 1.0 of the CDDL.
+.\"
+.\" A full copy of the text of the CDDL should have accompanied this
+.\" source.  A copy of the CDDL is also available via the Internet at
+.\" https://opensource.org/license/CDDL-1.0.
+.\"
+.\" Copyright (c) 2026, Vesta Corporation.
+.\" Copyright (c) 2026, Todd Curry.
+.\"
+.Dd November 15, 2026
+.Dt ZFS-PRESAGE 8
+.Os
+.
+.Sh NAME
+.Nm zfs-presage
+.Nd keep file or volume data resident in the ARC for a limited time
+.Sh SYNOPSIS
+.Nm zfs
+.Cm presage
+.Op Fl V
+.Op Fl s Ar start
+.Op Fl t Ar ttl
+.Op Fl o Ar offset
+.Op Fl l Ar length
+.Ar file Ns | Ns Ar volume Ns …
+.Nm zfs
+.Cm presage
+.Fl t Cm 0
+.Op Fl V
+.Op Fl s Ar start
+.Op Fl o Ar offset
+.Op Fl l Ar length
+.Ar file Ns | Ns Ar volume Ns …
+.Nm zfs
+.Cm presage status
+.Op Fl p
+.Op Fl V
+.Op Fl o Ar offset
+.Op Fl l Ar length
+.Ar file Ns | Ns Ar volume Ns …
+.
+.Sh DESCRIPTION
+Keeps the data of
+.Ar file
+or
+.Ar volume
+.Pq or the byte range given by Fl o No and Fl l
+resident in the ARC from
+.Ar start
+for
+.Ar ttl
+seconds, regardless of what the adaptive replacement algorithm would do.
+The request is a
+.Em reservation :
+it survives the command, may start in the future, and while active it
+re-sweeps its range every few seconds so blocks written into the file
+during the window become resident too.
+That makes
+.Dl : > backup.dump && zfs presage -t 2h backup.dump && pg_dump -Fc > backup.dump
+a one-liner: the file is created empty, or emptied, first, because a
+file must exist to be presaged and its old contents are not worth
+loading; the reservation on the empty file then presages the dump's
+blocks a few seconds after they are written out.
+.Pp
+Residency is bounded by
+.Sy zfs_arc_presaged_max_percent
+of the current ARC target
+.Pq see Xr zfs 4 ,
+which is 0 by default, i.e. the feature is off.
+When the ARC target shrinks under memory pressure, the presaged data
+above the new, smaller limit is demoted within about a second to the
+most recently used end of the MFU list, and is then evicted like other
+MFU data; the presaged data within the limit stays.
+A request beyond the cap fails with
+.Er ENOSPC
+and whatever fitted stays resident.
+.Bl -tag -width "-s start"
+.It Fl s Ar start
+When warming begins.
+.Sy +duration
+.Pq Sy +90s , +5m , +2h , +1d ,
+.Sy HH:MM
+.Pq today, or tomorrow if already past ,
+.Sy YYYY-MM-DD Ns Oo T Ns HH:MM Ns Oo :SS Oc Oc
+in local time, or seconds since the epoch.
+Default: now.
+With start in the future the command returns immediately; the status
+subcommand reports when warming finished.
+.It Fl t Ar ttl
+How long residency lasts from
+.Ar start ,
+as seconds or
+.Sy 90s , 5m , 2h , 1d .
+Default: 30 minutes.
+.Sy 0
+kills: active residency on the file ends now and its pending reservations
+are cancelled; with
+.Fl s
+only pending reservations starting at or after that time are cancelled.
+A file or volume that has no reservation is left as it is.
+To release presaged blocks that no reservation covers any more, presage
+the file or volume again and then kill it, or set
+.Sy zfs_arc_presaged_max_percent
+to
+.Sy 0 ,
+which releases everything presaged.
+.It Fl o Ar offset , Fl l Ar length
+A byte range instead of the whole file or volume.
+A later request on the same file and range replaces the earlier one.
+.It Fl V
+Every argument is the name of a volume
+.Pq Sy tank/vm/disk0 .
+Without
+.Fl V ,
+an argument that starts with
+.Pa /dev/zvol/
+is taken as a volume name, an argument that is a regular file is used as a
+file, and anything else is tried as a volume name and, if there is no such
+volume, opened as a file.
+A directory or other file that is not a regular file is rejected.
+A volume is presaged by name through the control node, so it need not be
+open and needs no device node; that is the normal case when warming a
+virtual machine's disk before the machine starts.
+A snapshot or a filesystem name is rejected; give a filesystem a file path.
+.It Cm status
+Report, per file: bytes presaged, bytes otherwise cached, bytes not in
+ARC, pending reservations, when warming finished and when the latest
+reservation expires.
+.Fl p
+prints times as epoch seconds.
+Status needs read permission on the file; everything else needs the
+system configuration privilege
+.Pq Sy CAP_SYS_ADMIN .
+.El
+.
+.Sh NOTES
+Requesting and killing residency require the same privilege as other
+system configuration
+.Pq Dv CAP_SYS_ADMIN No in the initial user namespace on Linux ,
+for files and for volumes alike; the privilege cannot be delegated with
+.Xr zfs-allow 8 .
+.Cm status
+needs only read access to the file, or, for a volume named on the command
+line, that the volume is visible to the caller, as for
+.Xr zfs-list 8 .
+.Pp
+The total amount presaged is bounded by the
+.Sy zfs_arc_presaged_max_percent
+module parameter, which is 0 (disabled) by default; see
+.Xr zfs 4 .
+A request that would exceed it presages what fits and fails with
+.Er ENOSPC .
+If memory pressure shrinks the ARC target, the presaged blocks above the
+reduced limit are released early, as described above.
+The limit bounds the presaged blocks themselves.
+Reading presaged data with
+.Xr read 2
+or through a mapping makes copies in the dbuf cache, which are not counted
+against it, so the memory held on behalf of presaged data can exceed the
+limit by up to the size of the dbuf cache, 1/32 of the ARC by default.
+An encrypted block that was written and then read is cached both as
+stored and decrypted, and both forms count against the limit.
+.Pp
+Residency is per block, not per file.
+While a reservation is active the file is swept again every few seconds
+when its size or block count changed, so blocks appended during the
+window are covered by that periodic re-sweep.
+A block rewritten in place is covered on a best-effort basis: when the
+rewrite completes before the deadline and the cap has room, the new copy
+takes the old one's place in the presaged state at once
+.Pq counted in the Sy presaged_inherited No arcstat ;
+a whole-record write of a block no longer in the dbuf cache finds the old
+copy by one ARC lookup before the write
+.Pq Sy presaged_lookups , Sy presaged_inherited_lookup
+and inherits the same way; a block demoted for the cap does not come back
+by being rewritten.
+A synchronous rewrite that reaches the disk ahead of its transaction
+group
+.Po
+.Xr fsync 2
+or
+.Dv O_SYNC
+on a dataset with
+.Sy logbias Ns = Ns Sy throughput ,
+large synchronous writes with any
+.Sy logbias
+.Pc
+inherits when that transaction group is synced, a few seconds later;
+until then the new copy is cached but not presaged.
+A write with
+.Dv O_DIRECT
+leaves no copy in the ARC and does not inherit: such a block is covered
+again only by the periodic re-sweep, when the file's size or allocation
+changed, and the copy it replaces leaves the presaged state when the
+write is synced out.
+Keeping a heavily rewritten file fully resident is therefore not
+guaranteed; the reservation is best effort for changing data.
+A snapshot does not disturb a presaged file, and rewriting the file under
+a snapshot does not grow what is presaged: the deadline moves from the
+overwritten copy to the new one.
+Blocks that a truncation, a hole punch or the deletion of the file removes
+from it leave the presaged state when the change is written out, whether
+or not a snapshot keeps them.
+The metadata block that holds the file's dnode, which the file shares with
+its neighbours, is not among them: after a deletion it stays until the
+deadline, 16 KiB per file at most.
+A block shared by several files, through a clone, a reflink copy or
+deduplication, is presaged for all of them, and where more than one of
+them is presaged it stays until the latest of their deadlines.
+It leaves early when any of the files that share it frees or rewrites it,
+or when the reservation of one of them is killed; presaging the remaining
+file again restores it.
+A request made while the dataset's
+.Sy primarycache
+is other than
+.Sy all
+does not presage its data and reports it as it finds it, cached or not.
+Data presaged before the property was changed stays until its deadline.
+Reads with
+.Dv O_DIRECT
+do not use presaged data.
+An application that keeps its own cache and both reads and writes with
+.Dv O_DIRECT
+gains nothing from a reservation on its files and pays for the re-sweep,
+which reads back from disk what the application wrote.
+.Pp
+A second request for the same file and range replaces the first, even
+with a shorter TTL.
+If the second request starts later, what the first had presaged is
+released at once and loaded again at the new start.
+Where reservations for different ranges overlap, a block stays until
+the latest of their deadlines.
+.Pp
+Reservations are kept in memory only and are forgotten on export, reboot
+or module unload.
+Unmounting a filesystem releases its presaged files before the unmount
+completes, and
+.Nm zfs Cm unload-key
+releases the presaged volumes that use the key, so that nothing decrypted
+is held in memory once a key is unloaded.
+An
+.Cm unload-key
+that fails has still ended the reservations of the volumes under the
+dataset and released their blocks.
+While a key is being unloaded, the presaged volumes of the whole pool
+are left alone: a request for one of them loads nothing until the unload
+has ended, and a release waits likewise.
+A request made meanwhile for a volume that uses the key reports 0 bytes
+and is dropped, as the volume can no longer be read.
+A filesystem that is unmounted and mounted again, which
+.Nm zfs Cm rename
+and a change of
+.Sy mountpoint
+also do, therefore starts with nothing presaged.
+A restore releases every presaged file and volume on the dataset it
+restores:
+.Xr zfs-rollback 8 ,
+a rollback made by a channel program, and any
+.Xr zfs-receive 8
+into an existing dataset, incremental or
+.Fl F .
+What was asked for on the discarded state is not presumed wanted on the
+restored one, so the reservations are cancelled, the blocks are released
+within seconds without any file data being read, and the request can be
+made again in a quieter moment after the restore.
+Blocks the restore left unreferenced leave as the asynchronous destroy
+frees them.
+A restore waits only for the step a load in progress is on, at most ten
+seconds: a
+.Nm zfs Cm presage
+that is still loading the file or volume stops within one 64 MiB step,
+reports what it had loaded, and its reservation is cancelled with the
+rest.
+A request made while a restore is in progress loads nothing and reports
+0 bytes; it is cancelled with the rest if the restore replaces the
+dataset's contents, and is loaded once the restore has ended if it does
+not.
+A release asked for meanwhile, with
+.Fl t Ar 0
+or by a request that starts later, takes effect once the restore has
+ended.
+The
+.Sy zfs/presage
+kstat reports how many reservations exist, how many are pending or
+active, how many loads are in flight and how many dataset holds presage
+holds at the moment.
+.Sh SEE ALSO
+.Xr zfs 4 ,
+.Xr zfsprops 7

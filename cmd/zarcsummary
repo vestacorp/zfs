@@ -608,9 +608,11 @@ def section_arc(kstats_dict):
     mrug_metadata = arc_stats['mru_ghost_metadata']
     unc_data = arc_stats['uncached_data']
     unc_metadata = arc_stats['uncached_metadata']
+    presaged_data = arc_stats.get('presaged_data', 0)
+    presaged_metadata = arc_stats.get('presaged_metadata', 0)
     caches_size = int(anon_data)+int(anon_metadata)+\
         int(mfu_data)+int(mfu_metadata)+int(mru_data)+int(mru_metadata)+\
-        int(unc_data)+int(unc_metadata)
+        int(unc_data)+int(unc_metadata)+int(presaged_data)+int(presaged_metadata)
 
     prt_1('ARC types breakdown (compressed + overhead):', f_bytes(caches_size))
     prt_i2('Data size:',
@@ -661,6 +663,10 @@ def section_arc(kstats_dict):
            f_perc(unc_data, caches_size), f_bytes(unc_data))
     prt_i2('Uncached metadata size:',
            f_perc(unc_metadata, caches_size), f_bytes(unc_metadata))
+    prt_i2('Presaged data size:',
+           f_perc(presaged_data, caches_size), f_bytes(presaged_data))
+    prt_i2('Presaged metadata size:',
+           f_perc(presaged_metadata, caches_size), f_bytes(presaged_metadata))
     print()
 
     print('ARC hash breakdown:')
@@ -812,7 +818,8 @@ def section_archits(kstats_dict):
                 arc_stats['mfu_ghost_hits']),
                ('Most recently used (MRU) ghost:',
                 arc_stats['mru_ghost_hits']),
-               ('Uncached:', arc_stats['uncached_hits']))
+               ('Uncached:', arc_stats['uncached_hits']),
+               ('Presaged:', arc_stats.get('presaged_hits', 0)))
     for title, value in cl_todo:
         prt_i2(title, f_perc(value, all_accesses), f_hits(value))
     print()

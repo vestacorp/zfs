@@ -68,6 +68,7 @@ usr/share/man/man8/zfs-list.8
 usr/share/man/man8/zfs-load-key.8
 usr/share/man/man8/zfs-mount-generator.8
 usr/share/man/man8/zfs-mount.8
+usr/share/man/man8/zfs-presage.8
 usr/share/man/man8/zfs-program.8
 usr/share/man/man8/zfs-project.8
 usr/share/man/man8/zfs-projectspace.8

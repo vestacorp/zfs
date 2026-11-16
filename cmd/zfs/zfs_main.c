@@ -111,6 +111,7 @@ static int zfs_do_project(int argc, char **argv);
 static int zfs_do_version(int argc, char **argv);
 static int zfs_do_redact(int argc, char **argv);
 static int zfs_do_rewrite(int argc, char **argv);
+static int zfs_do_presage(int argc, char **argv);
 static int zfs_do_wait(int argc, char **argv);
 
 #ifdef __FreeBSD__
@@ -166,6 +167,7 @@ typedef enum {
 	HELP_VERSION,
 	HELP_REDACT,
 	HELP_REWRITE,
+	HELP_PRESAGE,
 	HELP_JAIL,
 	HELP_UNJAIL,
 	HELP_WAIT,
@@ -237,6 +239,7 @@ static zfs_command_t command_table[] = {
 	{ NULL },
 	{ "program",	zfs_do_channel_program,	HELP_CHANNEL_PROGRAM	},
 	{ "rewrite",	zfs_do_rewrite,		HELP_REWRITE		},
+	{ "presage",	zfs_do_presage,		HELP_PRESAGE		},
 	{ "wait",	zfs_do_wait,		HELP_WAIT		},
 
 #ifdef __FreeBSD__
@@ -414,6 +417,13 @@ get_usage(zfs_help_t idx)
 	case HELP_REWRITE:
 		return ("\trewrite [-CPSWrvx] [-o <offset>] "
 		    "[-l <length>] <directory|file ...>\n");
+	case HELP_PRESAGE:
+		return ("\tpresage [-V] [-s <start>] [-t <ttl>]\n"
+		    "\t     [-o <offset>] [-l <length>] <file|volume ...>\n"
+		    "\tpresage -t 0 [-V] [-s <start>] [-o <offset>] "
+		    "[-l <length>] <file|volume ...>\n"
+		    "\tpresage status [-p] [-V] [-o <offset>] [-l <length>] "
+		    "<file|volume ...>\n");
 	case HELP_JAIL:
 		return ("\tjail <jailid|jailname> <filesystem>\n");
 	case HELP_UNJAIL:
@@ -9284,6 +9294,357 @@ zfs_do_rewrite(int argc, char **argv)
 	}
 	fnvlist_free(dirs);
 
+	return (ret);
+}
+
+/*
+ * zfs presage: ask the ARC to keep the data of files and volumes resident
+ * until a deadline.  There is no recursion into directories.
+ */
+/* Longest TTL and furthest start, as ZFS_PRESAGE_MAX_SECONDS in the kernel */
+#define	PRESAGE_MAX_SECONDS	(30 * 24 * 3600)
+
+/*
+ * "300", "90s", "5m", "2h", "1d" -> seconds; UINT64_MAX on error, which
+ * includes a sign, a value that does not fit and anything after the unit.
+ */
+static uint64_t
+presage_parse_duration(const char *s)
+{
+	char *end;
+	uint64_t v, mult;
+
+	if (!isdigit((unsigned char)s[0]))
+		return (UINT64_MAX);
+	errno = 0;
+	v = strtoull(s, &end, 10);
+	if (errno != 0)
+		return (UINT64_MAX);
+	switch (*end) {
+	case '\0': case 's': mult = 1; break;
+	case 'm': mult = 60; break;
+	case 'h': mult = 3600; break;
+	case 'd': mult = 86400; break;
+	default: return (UINT64_MAX);
+	}
+	if (end[0] != '\0' && end[1] != '\0')
+		return (UINT64_MAX);
+	if (v > (UINT64_MAX - 1) / mult)
+		return (UINT64_MAX);
+	return (v * mult);
+}
+
+/*
+ * Start time: "+<duration>" (relative), "HH:MM" (today, or tomorrow if
+ * already past), "YYYY-MM-DD[THH:MM[:SS]]" (local time), or epoch seconds.
+ * UINT64_MAX on error, which includes anything left over after the form.
+ */
+static uint64_t
+presage_parse_start(const char *s)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+	const char *p;
+
+	if (s[0] == '+') {
+		uint64_t d = presage_parse_duration(s + 1);
+		if (d == UINT64_MAX || d >= UINT64_MAX - (uint64_t)now)
+			return (UINT64_MAX);
+		return ((uint64_t)now + d);
+	}
+	if (strlen(s) == 5 && s[2] == ':') {
+		localtime_r(&now, &tm);
+		p = strptime(s, "%H:%M", &tm);
+		if (p == NULL || *p != '\0')
+			return (UINT64_MAX);
+		tm.tm_sec = 0;
+		tm.tm_isdst = -1;
+		time_t t = mktime(&tm);
+		if (t == (time_t)-1)
+			return (UINT64_MAX);
+		if (t <= now) {
+			/* the same time tomorrow, by the calendar */
+			tm.tm_mday++;
+			tm.tm_isdst = -1;
+			t = mktime(&tm);
+			if (t == (time_t)-1)
+				return (UINT64_MAX);
+		}
+		return ((uint64_t)t);
+	}
+	if (strlen(s) >= 10 && s[4] == '-') {
+		memset(&tm, 0, sizeof (tm));
+		tm.tm_isdst = -1;
+		const char *fmt = strlen(s) > 16 ? "%Y-%m-%dT%H:%M:%S" :
+		    strlen(s) > 10 ? "%Y-%m-%dT%H:%M" : "%Y-%m-%d";
+		p = strptime(s, fmt, &tm);
+		if (p == NULL || *p != '\0')
+			return (UINT64_MAX);
+		time_t t = mktime(&tm);
+		if (t < 0)
+			return (UINT64_MAX);
+		return ((uint64_t)t);
+	}
+	if (!isdigit((unsigned char)s[0]))
+		return (UINT64_MAX);
+	char *end;
+	errno = 0;
+	uint64_t v = strtoull(s, &end, 10);
+	return ((errno != 0 || *end != '\0') ? UINT64_MAX : v);
+}
+
+/*
+ * An offset or length in bytes: decimal, or C-style hexadecimal or
+ * octal.  Returns -1 for anything else, a sign or a value that does not
+ * fit included.
+ */
+static int
+presage_parse_bytes(const char *s, uint64_t *vp)
+{
+	char *end;
+
+	if (!isdigit((unsigned char)s[0]))
+		return (-1);
+	errno = 0;
+	*vp = strtoull(s, &end, 0);
+	return ((errno != 0 || *end != '\0') ? -1 : 0);
+}
+
+static void
+presage_fmt_time(uint64_t t, char *buf, size_t len, boolean_t parsable)
+{
+	if (parsable || t == 0) {
+		(void) snprintf(buf, len, "%llu", (u_longlong_t)t);
+		return;
+	}
+	time_t tt = (time_t)t;
+	struct tm tm;
+	localtime_r(&tt, &tm);
+	(void) strftime(buf, len, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+/*
+ * One request on a volume, by dataset name, through the control node.
+ * Fills the out fields of *a like the file ioctl does.  Returns 0 or an
+ * errno.
+ */
+static int
+presage_volume(const char *volname, zfs_presage_args_t *a)
+{
+	nvlist_t *result = NULL;
+	int err = lzc_presage(volname, a->off, a->len, a->start, a->ttl,
+	    a->flags, &result);
+
+	if (err == 0 && result != NULL) {
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_PRESAGED,
+		    &a->presaged);
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_CACHED,
+		    &a->cached);
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_UNCACHED,
+		    &a->uncached);
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_PENDING,
+		    &a->pending);
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_WARMED_AT,
+		    &a->warmed_at);
+		(void) nvlist_lookup_uint64(result, ZFS_PRESAGE_NV_EXPIRES_AT,
+		    &a->expires_at);
+	}
+	nvlist_free(result);
+	return (err);
+}
+
+/*
+ * Decide how to reach one argument.  Returns 0 and sets *volname to the
+ * volume name to use with the dataset ioctl (which may point into arg),
+ * or to NULL for a file to open.  When the argument is neither, says why
+ * and returns an errno.
+ */
+static int
+presage_target(const char *arg, boolean_t volume, const char **volname)
+{
+	struct stat st;
+	boolean_t found;
+
+	*volname = NULL;
+	if (volume || strncmp(arg, ZVOL_DIR, strlen(ZVOL_DIR)) == 0) {
+		const char *name = volume ? arg : arg + strlen(ZVOL_DIR);
+
+		if (zfs_dataset_exists(g_zfs, name, ZFS_TYPE_VOLUME)) {
+			*volname = name;
+			return (0);
+		}
+		if (zfs_dataset_exists(g_zfs, name, ZFS_TYPE_FILESYSTEM |
+		    ZFS_TYPE_SNAPSHOT)) {
+			(void) fprintf(stderr, "%s: not a volume\n", arg);
+			return (EINVAL);
+		}
+		(void) fprintf(stderr, "%s: no such volume\n", arg);
+		return (ENOENT);
+	}
+	found = (stat(arg, &st) == 0);
+	if (found && S_ISREG(st.st_mode))
+		return (0);
+	if (zfs_dataset_exists(g_zfs, arg, ZFS_TYPE_VOLUME)) {
+		*volname = arg;
+		return (0);
+	}
+	if (zfs_dataset_exists(g_zfs, arg, ZFS_TYPE_FILESYSTEM)) {
+		(void) fprintf(stderr,
+		    "%s: is a filesystem; give a file path\n", arg);
+		return (EISDIR);
+	}
+	if (zfs_dataset_exists(g_zfs, arg, ZFS_TYPE_SNAPSHOT)) {
+		(void) fprintf(stderr, "%s: not a volume\n", arg);
+		return (EINVAL);
+	}
+	if (found && S_ISDIR(st.st_mode)) {
+		(void) fprintf(stderr, "%s: is a directory\n", arg);
+		return (EISDIR);
+	}
+	if (found) {
+		(void) fprintf(stderr, "%s: not a regular file\n", arg);
+		return (EINVAL);
+	}
+	return (0);	/* opened as a file, which reports what is wrong */
+}
+
+static int
+zfs_do_presage(int argc, char **argv)
+{
+	zfs_presage_args_t args;
+	boolean_t status = B_FALSE, parsable = B_FALSE, have_ttl = B_FALSE;
+	boolean_t volume = B_FALSE;
+	const char *start_arg = NULL;
+	int c, ret = 0;
+
+	memset(&args, 0, sizeof (args));
+	if (argc > 1 && strcmp(argv[1], "status") == 0) {
+		status = B_TRUE;
+		args.flags = ZFS_PRESAGE_STATUS;
+		argc--;
+		argv++;
+	}
+	while ((c = getopt(argc, argv, "l:o:ps:t:V")) != -1) {
+		switch (c) {
+		case 'l':
+			if (presage_parse_bytes(optarg, &args.len) != 0) {
+				(void) fprintf(stderr,
+				    "invalid length '%s'\n", optarg);
+				usage(B_FALSE);
+			}
+			break;
+		case 'o':
+			if (presage_parse_bytes(optarg, &args.off) != 0) {
+				(void) fprintf(stderr,
+				    "invalid offset '%s'\n", optarg);
+				usage(B_FALSE);
+			}
+			break;
+		case 'p':
+			parsable = B_TRUE;
+			break;
+		case 'V':
+			volume = B_TRUE;
+			break;
+		case 's':
+			args.start = presage_parse_start(optarg);
+			if (args.start == UINT64_MAX) {
+				(void) fprintf(stderr,
+				    "invalid start time '%s'\n", optarg);
+				usage(B_FALSE);
+			}
+			start_arg = optarg;
+			break;
+		case 't':
+			args.ttl = presage_parse_duration(optarg);
+			if (args.ttl == UINT64_MAX) {
+				(void) fprintf(stderr,
+				    "invalid TTL '%s'\n", optarg);
+				usage(B_FALSE);
+			}
+			if (args.ttl > PRESAGE_MAX_SECONDS) {
+				(void) fprintf(stderr, "invalid TTL '%s': "
+				    "at most 30 days\n", optarg);
+				usage(B_FALSE);
+			}
+			have_ttl = B_TRUE;
+			break;
+		default:
+			(void) fprintf(stderr, "invalid option '%c'\n",
+			    optopt);
+			usage(B_FALSE);
+		}
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc == 0 || (status && (have_ttl || args.start != 0)))
+		usage(B_FALSE);
+	if (!status && !have_ttl)
+		args.ttl = 1800;	/* the documented default */
+	boolean_t kill = (!status && args.ttl == 0);
+	uint64_t now = (uint64_t)time(NULL);
+	if (!status && !kill && args.start > now &&
+	    args.start - now > PRESAGE_MAX_SECONDS) {
+		(void) fprintf(stderr, "invalid start time '%s': "
+		    "at most 30 days ahead\n", start_arg);
+		usage(B_FALSE);
+	}
+
+	for (int i = 0; i < argc; i++) {
+		const char *volname;
+		int fd = -1, err = presage_target(argv[i], volume, &volname);
+		if (err != 0) {
+			ret = err;
+			continue;
+		}
+		if (volname == NULL) {
+			fd = open(argv[i], O_RDONLY);
+			if (fd < 0) {
+				ret = errno;
+				(void) fprintf(stderr, "failed to open %s: "
+				    "%s\n", argv[i], strerror(errno));
+				continue;
+			}
+		}
+		zfs_presage_args_t a = args;
+		if (volname != NULL)
+			err = presage_volume(volname, &a);
+		else
+			err = ioctl(fd, ZFS_IOC_PRESAGE, &a) < 0 ? errno : 0;
+		if (err != 0) {
+			ret = err;
+			(void) fprintf(stderr, "%s: %s\n", argv[i],
+			    err == ENOSPC ? "presage limit reached "
+			    "(zfs_arc_presaged_max_percent)" :
+			    err == ENOTSUP ? "presage is disabled "
+			    "(zfs_arc_presaged_max_percent=0)" :
+			    err == EAGAIN ? "too many reservations" :
+			    err == EBUSY ? "reservation is loading, retry" :
+			    err == EACCES && volname != NULL ?
+			    "encryption key is not loaded" :
+			    err == ENOENT && kill ? "nothing to kill" :
+			    strerror(err));
+			if (fd >= 0)
+				close(fd);
+			continue;
+		}
+		char w[32], e[32];
+		presage_fmt_time(a.warmed_at, w, sizeof (w), parsable);
+		presage_fmt_time(a.expires_at, e, sizeof (e), parsable);
+		if (kill) {
+			(void) printf("%s\tkilled\tpending %llu\n", argv[i],
+			    (u_longlong_t)a.pending);
+		} else {
+			(void) printf("%s\tpresaged %llu\tcached %llu\t"
+			    "uncached %llu\tpending %llu\twarmed %s\t"
+			    "expires %s\n", argv[i],
+			    (u_longlong_t)a.presaged, (u_longlong_t)a.cached,
+			    (u_longlong_t)a.uncached, (u_longlong_t)a.pending,
+			    w, e);
+		}
+		if (fd >= 0)
+			close(fd);
+	}
 	return (ret);
 }
 
