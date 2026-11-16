@@ -379,6 +379,21 @@ zfs_ioctl(vnode_t *vp, ulong_t com, intptr_t data, int flag, cred_t *cred,
 		VOP_UNLOCK(vp);
 		return (error);
 	}
+	case ZFS_IOC_PRESAGE: {
+		zfs_presage_args_t *args = (zfs_presage_args_t *)data;
+		if ((flag & FREAD) == 0)
+			return (SET_ERROR(EBADF));
+		if (!(args->flags & ZFS_PRESAGE_STATUS) &&
+		    (error = secpolicy_sys_config(curthread->td_ucred,
+		    B_FALSE)) != 0)
+			return (error);
+		error = vn_lock(vp, LK_SHARED);
+		if (error)
+			return (error);
+		error = zfs_presage(VTOZ(vp), args);
+		VOP_UNLOCK(vp);
+		return (error);
+	}
 	case ZFS_IOC_REWRITE: {
 		zfs_rewrite_args_t *args = (zfs_rewrite_args_t *)data;
 		if ((flag & FWRITE) == 0)

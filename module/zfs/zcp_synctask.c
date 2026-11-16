@@ -34,6 +34,9 @@
 #include <sys/zfeature.h>
 #include <sys/metaslab.h>
 #include "zfs_namecheck.h"
+#ifdef _KERNEL
+#include <sys/zfs_presage.h>
+#endif
 
 #define	DST_AVG_BLKSHIFT 14
 
@@ -310,6 +313,25 @@ zcp_synctask_rollback(lua_State *state, boolean_t sync, nvlist_t *err_details)
 
 	err = zcp_sync_task(state, dsl_dataset_rollback_check,
 	    dsl_dataset_rollback_sync, &ddra, sync, dsname);
+
+#ifdef _KERNEL
+	/*
+	 * Rolled back: presage reservations on the dataset are cancelled,
+	 * as zfs_ioc_rollback() does.  Only an unowned dataset gets here
+	 * (the check refuses a mounted filesystem or an open volume), so
+	 * there is nothing to stand still first.
+	 */
+	if (err == 0 && sync) {
+		dsl_pool_t *dp = zcp_run_info(state)->zri_pool;
+		dsl_dataset_t *ds;
+
+		if (dsl_dataset_hold(dp, dsname, FTAG, &ds) == 0) {
+			zfs_presage_drop_objset(spa_guid(dp->dp_spa),
+			    ds->ds_object);
+			dsl_dataset_rele(ds, FTAG);
+		}
+	}
+#endif
 
 	return (err);
 }

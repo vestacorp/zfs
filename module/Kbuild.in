@@ -439,6 +439,7 @@ ZFS_OBJS := \
 	zfs_ioctl.o \
 	zfs_log.o \
 	zfs_onexit.o \
+	zfs_presage.o \
 	zfs_quota.o \
 	zfs_ratelimit.o \
 	zfs_replay.o \

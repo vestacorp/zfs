@@ -84,6 +84,9 @@
 #include <sys/zfeature.h>
 #include <sys/dsl_destroy.h>
 #include <sys/zvol.h>
+#ifdef _KERNEL
+#include <sys/zfs_presage.h>
+#endif
 
 #ifdef	_KERNEL
 #include <sys/fm/protocol.h>
@@ -8110,6 +8113,9 @@ spa_export_common(const char *pool, int new_state, nvlist_t **oldconfig,
 			spa_config_exit(spa, SCL_ALL, FTAG);
 		}
 	}
+#ifdef _KERNEL
+	zfs_presage_drop_pool(spa_guid(spa));
+#endif
 
 export_spa:
 	spa_export_os(spa);

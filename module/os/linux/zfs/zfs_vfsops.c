@@ -29,6 +29,7 @@
 #include <sys/cmn_err.h>
 #include <sys/zfs_znode.h>
 #include <sys/zfs_vnops.h>
+#include <sys/zfs_presage.h>
 #include <sys/zfs_dir.h>
 #include <sys/zil.h>
 #include <sys/fs/zfs.h>
@@ -1616,6 +1617,9 @@ zfs_umount(struct super_block *sb)
 
 	if (zfsvfs->z_arc_prune != NULL)
 		arc_remove_prune_callback(zfsvfs->z_arc_prune);
+	/* Release this filesystem's presaged files while it can be walked. */
+	if (zfsvfs->z_os != NULL)
+		zfs_presage_unmount(zfsvfs->z_os);
 	VERIFY0(zfsvfs_teardown(zfsvfs, B_TRUE));
 	os = zfsvfs->z_os;
 

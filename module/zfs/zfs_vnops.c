@@ -51,6 +51,7 @@
 #include <sys/policy.h>
 #include <sys/zfeature.h>
 #include <sys/zfs_vnops.h>
+#include <sys/zfs_presage.h>
 #include <sys/zfs_quota.h>
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_znode.h>
@@ -1153,6 +1154,61 @@ zfs_rewrite_skip(dmu_buf_t *db, objset_t *os, uint64_t flags,
 	}
 
 	return (B_FALSE);
+}
+
+/*
+ * Presage a range of a file: request that it stay in the ARC until a
+ * deadline, kill such a request, or report on the range.
+ *
+ *	IN:	zp	- znode of the file.
+ *		args	- range, start, ttl and flags (ZFS_IOC_PRESAGE).
+ *
+ *	OUT:	args	- bytes presaged, cached and uncached; pending
+ *			  reservations; warming and expiry times.
+ *
+ *	RETURN:	0 if success
+ *		error code if failure
+ */
+int
+zfs_presage(znode_t *zp, zfs_presage_args_t *args)
+{
+	int error;
+
+	if ((args->flags & ~ZFS_PRESAGE_STATUS) != 0 ||
+	    (args->reserved[0] | args->reserved[1] | args->reserved[2] |
+	    args->reserved[3]) != 0)
+		return (SET_ERROR(EINVAL));
+	/* A directory's size is not in bytes; only file data is presaged. */
+	if (S_ISDIR(zp->z_mode))
+		return (SET_ERROR(EISDIR));
+	if (!S_ISREG(zp->z_mode))
+		return (SET_ERROR(EINVAL));
+
+	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+	if ((error = zfs_enter_verify_zp(zfsvfs, zp, FTAG)) != 0)
+		return (error);
+
+	args->presaged = args->cached = args->uncached = 0;
+	args->pending = args->warmed_at = args->expires_at = 0;
+
+	if (args->flags & ZFS_PRESAGE_STATUS) {
+		uint64_t off = args->off, len = args->len;
+		if (off < zp->z_size) {
+			if (len == 0 || len > zp->z_size - off)
+				len = zp->z_size - off;
+			error = dmu_presage(zfsvfs->z_os, zp->z_id, off, len,
+			    0, ZFS_PRESAGE_STATUS, &args->presaged,
+			    &args->cached, &args->uncached);
+		}
+		zfs_presage_status(zp, args);
+	} else if (args->ttl == 0) {
+		error = zfs_presage_kill(zp, args);
+	} else {
+		error = zfs_presage_request(zp, args);
+	}
+
+	zfs_exit(zfsvfs, FTAG);
+	return (error);
 }
 
 /*

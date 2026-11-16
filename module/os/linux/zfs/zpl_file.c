@@ -28,6 +28,7 @@
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_vnops.h>
 #include <sys/zfs_project.h>
+#include <sys/policy.h>
 #include <linux/pagemap_compat.h>
 #include <linux/fadvise.h>
 #ifdef HAVE_VFS_FILEMAP_DIRTY_FOLIO
@@ -1335,6 +1336,33 @@ zpl_ioctl_getfsuuid(struct file *filp, void __user *arg)
 	return (0);
 }
 #endif /* !HAVE_SUPER_SET_UUID */
+static int
+zpl_ioctl_presage(struct file *filp, void __user *arg)
+{
+	struct inode *ip = file_inode(filp);
+	zfs_presage_args_t args;
+	fstrans_cookie_t cookie;
+	int err;
+
+	if (copy_from_user(&args, arg, sizeof (args)))
+		return (-EFAULT);
+
+	if (unlikely(!(filp->f_mode & FMODE_READ)))
+		return (-EBADF);
+
+	/* Pinning RAM is a system-wide resource decision. */
+	if (!(args.flags & ZFS_PRESAGE_STATUS) &&
+	    secpolicy_sys_config(CRED(), B_FALSE) != 0)
+		return (-EPERM);
+
+	cookie = spl_fstrans_mark();
+	err = -zfs_presage(ITOZ(ip), &args);
+	spl_fstrans_unmark(cookie);
+
+	if (copy_to_user(arg, &args, sizeof (args)))
+		return (-EFAULT);
+	return (err);
+}
 
 static long
 zpl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -1360,6 +1388,8 @@ zpl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return (zpl_ioctl_setdosflags(filp, (void *)arg));
 	case ZFS_IOC_REWRITE:
 		return (zpl_ioctl_rewrite(filp, (void *)arg));
+	case ZFS_IOC_PRESAGE:
+		return (zpl_ioctl_presage(filp, (void *)arg));
 	default:
 		return (-ENOTTY);
 	}
@@ -1384,6 +1414,9 @@ zpl_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		/* The ioctl is the same in 32-bit and 64-bit mode. */
 		break;
 #endif
+	case ZFS_IOC_PRESAGE:
+		/* Only uint64_t fields: the same layout in both modes. */
+		break;
 	default:
 		return (-ENOTTY);
 	}

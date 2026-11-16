@@ -101,6 +101,7 @@
     <elf-symbol name='lzc_pool_checkpoint' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='lzc_pool_checkpoint_discard' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='lzc_pool_prefetch' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
+    <elf-symbol name='lzc_presage' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='lzc_promote' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='lzc_receive' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
     <elf-symbol name='lzc_receive_one' type='func-type' binding='global-binding' visibility='default-visibility' is-defined='yes'/>
@@ -2447,6 +2448,7 @@
       <enumerator name='ZFS_IOC_POOL_PREFETCH' value='23128'/>
       <enumerator name='ZFS_IOC_DDT_PRUNE' value='23129'/>
       <enumerator name='ZFS_IOC_POOL_CONDENSE' value='23130'/>
+      <enumerator name='ZFS_IOC_PRESAGE_DATASET' value='23131'/>
       <enumerator name='ZFS_IOC_PLATFORM' value='23168'/>
       <enumerator name='ZFS_IOC_EVENTS_NEXT' value='23169'/>
       <enumerator name='ZFS_IOC_EVENTS_CLEAR' value='23170'/>
@@ -4091,6 +4093,16 @@
       <parameter type-id='80f4b756' name='fs'/>
       <parameter type-id='3024501a' name='activity'/>
       <parameter type-id='37e3bd22' name='waited'/>
+      <return type-id='95e97e5e'/>
+    </function-decl>
+    <function-decl name='lzc_presage' mangled-name='lzc_presage' visibility='default' binding='global' size-in-bits='64' elf-symbol-id='lzc_presage'>
+      <parameter type-id='80f4b756' name='volname'/>
+      <parameter type-id='9c313c2d' name='off'/>
+      <parameter type-id='9c313c2d' name='len'/>
+      <parameter type-id='9c313c2d' name='start'/>
+      <parameter type-id='9c313c2d' name='ttl'/>
+      <parameter type-id='9c313c2d' name='flags'/>
+      <parameter type-id='857bb57e' name='result'/>
       <return type-id='95e97e5e'/>
     </function-decl>
     <function-decl name='lzc_set_bootenv' mangled-name='lzc_set_bootenv' visibility='default' binding='global' size-in-bits='64' elf-symbol-id='lzc_set_bootenv'>

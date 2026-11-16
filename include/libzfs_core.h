@@ -146,6 +146,9 @@ _LIBZFS_CORE_H int lzc_pool_prefetch(const char *, zpool_prefetch_type_t);
 
 _LIBZFS_CORE_H int lzc_wait_fs(const char *, zfs_wait_activity_t, boolean_t *);
 
+_LIBZFS_CORE_H int lzc_presage(const char *, uint64_t, uint64_t, uint64_t,
+    uint64_t, uint64_t, nvlist_t **);
+
 _LIBZFS_CORE_H int lzc_set_bootenv(const char *, const nvlist_t *);
 _LIBZFS_CORE_H int lzc_get_bootenv(const char *, nvlist_t **);
 

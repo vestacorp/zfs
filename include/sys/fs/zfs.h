@@ -1716,6 +1716,7 @@ typedef enum zfs_ioc {
 	ZFS_IOC_POOL_PREFETCH,			/* 0x5a58 */
 	ZFS_IOC_DDT_PRUNE,			/* 0x5a59 */
 	ZFS_IOC_POOL_CONDENSE,			/* 0x5a5a */
+	ZFS_IOC_PRESAGE_DATASET,		/* 0x5a5b */
 
 	/*
 	 * Per-platform (Optional) - 8/128 numbers reserved.
@@ -2043,6 +2044,24 @@ typedef enum {
  * The following are names used when invoking ZFS_IOC_POOL_PREFETCH.
  */
 #define	ZPOOL_PREFETCH_TYPE		"prefetch_type"
+
+/*
+ * The following are names used when invoking ZFS_IOC_PRESAGE_DATASET, the
+ * dataset-named form of ZFS_IOC_PRESAGE for volumes.  The inputs mean what
+ * the same-named zfs_presage_args_t fields mean; the outputs are its out
+ * fields.
+ */
+#define	ZFS_PRESAGE_NV_OFFSET		"offset"
+#define	ZFS_PRESAGE_NV_LENGTH		"length"
+#define	ZFS_PRESAGE_NV_START		"start"
+#define	ZFS_PRESAGE_NV_TTL		"ttl"
+#define	ZFS_PRESAGE_NV_FLAGS		"flags"
+#define	ZFS_PRESAGE_NV_PRESAGED		"presaged"
+#define	ZFS_PRESAGE_NV_CACHED		"cached"
+#define	ZFS_PRESAGE_NV_UNCACHED		"uncached"
+#define	ZFS_PRESAGE_NV_PENDING		"pending"
+#define	ZFS_PRESAGE_NV_WARMED_AT	"warmed_at"
+#define	ZFS_PRESAGE_NV_EXPIRES_AT	"expires_at"
 
 /*
  * The following are names used when invoking ZFS_IOC_DDT_PRUNE.

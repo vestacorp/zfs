@@ -2059,6 +2059,32 @@ lzc_wait_fs(const char *fs, zfs_wait_activity_t activity, boolean_t *waited)
 }
 
 /*
+ * Presage a volume by name (ZFS_IOC_PRESAGE_DATASET): keep [off, off + len)
+ * of its data resident in the ARC from start (epoch seconds, 0 = now) for
+ * ttl seconds; ttl == 0 kills; flags may carry ZFS_PRESAGE_STATUS.  The
+ * result holds the "presaged", "cached", "uncached", "pending",
+ * "warmed_at" and "expires_at" uint64 keys and is the caller's to free.
+ */
+int
+lzc_presage(const char *volname, uint64_t off, uint64_t len, uint64_t start,
+    uint64_t ttl, uint64_t flags, nvlist_t **result)
+{
+	nvlist_t *args = fnvlist_alloc();
+
+	fnvlist_add_uint64(args, ZFS_PRESAGE_NV_OFFSET, off);
+	fnvlist_add_uint64(args, ZFS_PRESAGE_NV_LENGTH, len);
+	fnvlist_add_uint64(args, ZFS_PRESAGE_NV_START, start);
+	fnvlist_add_uint64(args, ZFS_PRESAGE_NV_TTL, ttl);
+	fnvlist_add_uint64(args, ZFS_PRESAGE_NV_FLAGS, flags);
+
+	int error = lzc_ioctl(ZFS_IOC_PRESAGE_DATASET, volname, args, result);
+
+	fnvlist_free(args);
+
+	return (error);
+}
+
+/*
  * Set the bootenv contents for the given pool.
  */
 int

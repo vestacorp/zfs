@@ -370,6 +370,7 @@ SRCS+=	abd.c \
 	zfs_ioctl.c \
 	zfs_log.c \
 	zfs_onexit.c \
+	zfs_presage.c \
 	zfs_quota.c \
 	zfs_ratelimit.c \
 	zfs_replay.c \

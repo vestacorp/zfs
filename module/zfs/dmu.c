@@ -1043,6 +1043,295 @@ dmu_prefetch_wait(objset_t *os, uint64_t object, uint64_t offset, uint64_t size)
 	return (err);
 }
 
+typedef struct dmu_presage_arg {
+	spa_t		*dap_spa;
+	uint32_t	dap_deadline;
+	uint32_t	dap_flags;
+	boolean_t	dap_data;	/* primarycache allows data */
+	boolean_t	dap_meta;	/* primarycache allows metadata */
+	uint64_t	dap_pinned;
+	uint64_t	dap_cached;
+	uint64_t	dap_uncached;
+} dmu_presage_arg_t;
+
+/*
+ * Apply one pin/release/status step to a block.  ENOSPC (presage cap reached)
+ * stops the walk; per-block ENOENT (not resident, I/O racing) does not.
+ */
+static int
+dmu_presage_bp(dmu_presage_arg_t *dap, const blkptr_t *bp, boolean_t data,
+    boolean_t rewriting)
+{
+	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return (0);
+
+	/*
+	 * A replacement does not mark the old copy of a block being
+	 * rewritten, but it must not leave it the old deadline either.
+	 */
+	if (rewriting && (dap->dap_flags & ZFS_PRESAGE_RESET))
+		arc_presage_lower(dap->dap_spa, bp, dap->dap_deadline);
+
+	if (!(dap->dap_flags & ZFS_PRESAGE_STATUS) && !rewriting &&
+	    ((dap->dap_flags & (ZFS_PRESAGE_RELEASE | ZFS_PRESAGE_EXPIRE)) ||
+	    (data ? dap->dap_data : dap->dap_meta))) {
+		uint64_t dummy = 0;
+		int err = arc_presage_mark(dap->dap_spa, bp, dap->dap_deadline,
+		    dap->dap_flags, &dummy);
+		if (err == ENOSPC || err == ENOTSUP)
+			return (err);
+	}
+	if (!data)
+		return (0);
+
+	int cf = arc_cached(dap->dap_spa, bp);
+	if (cf & ARC_CACHED_IN_PRESAGED)
+		dap->dap_pinned += BP_GET_LSIZE(bp);
+	else if (cf & ARC_CACHED_IN_L1)
+		dap->dap_cached += BP_GET_LSIZE(bp);
+	else
+		dap->dap_uncached += BP_GET_LSIZE(bp);
+	return (0);
+}
+
+/*
+ * Is this level-0 block being rewritten?  Its dbuf is dirty from the write
+ * until the new copy is on disk, and for part of that time the block
+ * pointer the walk sees is still the old one.  A mark must not touch that
+ * old copy: once the write has been issued its deadline has moved to the
+ * new copy (arc_presage_inherit_lookup()), and marking it again would
+ * leave a block the file no longer owns in the presaged state for as long
+ * as a snapshot keeps it.  The new copy inherits on its own, or is found
+ * by the next sweep.  dn_struct_rwlock is held.
+ */
+static boolean_t
+dmu_presage_rewriting(dnode_t *dn, uint64_t blkid)
+{
+	dmu_buf_impl_t *db = dbuf_find(dn->dn_objset, dn->dn_object, 0,
+	    blkid, NULL);
+	if (db == NULL)
+		return (B_FALSE);
+	boolean_t dirty = (db->db_dirtycnt != 0);
+	mutex_exit(&db->db_mtx);
+	return (dirty);
+}
+
+/*
+ * A release or a replacement must also reach the copies of this block that
+ * are on their way to disk.  They are anonymous in the ARC, so the walk
+ * cannot find them by block pointer, and each would carry the old deadline
+ * back into the presaged state when its write completes: a kill under
+ * rewrite would leave whatever was dirty at that moment presaged until the
+ * killed reservation's deadline.  Lower what the buffers of a dirty dbuf
+ * carry (to nothing for a release, to the new deadline for a replacement).
+ * The caller does this after it has dealt with the block pointer the file
+ * shows: the sync thread may be moving that old copy's deadline into a new
+ * buffer at this moment (arc_presage_inherit_lookup(), under the old
+ * header's hash lock), and in this order the walk either reaches the old
+ * header first or finds the deadline in the buffer.  The buffers are the
+ * dbuf's current one and, for a data block, the one each dirty record
+ * will write.  dn_struct_rwlock is held.
+ */
+static void
+dmu_presage_forget(dmu_buf_impl_t *db, uint32_t deadline)
+{
+	ASSERT(MUTEX_HELD(&db->db_mtx));
+	if (db->db_dirtycnt == 0 || db->db_blkid == DMU_BONUS_BLKID)
+		return;
+	if (db->db_buf != NULL)
+		arc_presage_forget(db->db_buf, deadline);
+	if (db->db_level != 0)
+		return;
+	for (dbuf_dirty_record_t *dr = list_head(&db->db_dirty_records);
+	    dr != NULL; dr = list_next(&db->db_dirty_records, dr)) {
+		if (dr->dt.dl.dr_data != NULL &&
+		    dr->dt.dl.dr_data != db->db_buf)
+			arc_presage_forget(dr->dt.dl.dr_data, deadline);
+	}
+}
+
+static void
+dmu_presage_forget_blkid(dnode_t *dn, uint64_t blkid, uint32_t deadline)
+{
+	dmu_buf_impl_t *db = dbuf_find(dn->dn_objset, dn->dn_object, 0,
+	    blkid, NULL);
+	if (db == NULL)
+		return;
+	dmu_presage_forget(db, deadline);
+	mutex_exit(&db->db_mtx);
+}
+
+/*
+ * Walk the blocks of [offset, offset + len): the L1 indirects and their L0
+ * pointers.  Mirrors dmu_object_cached_size().  Levels above L1 are left
+ * to normal ARC policy (tiny).  An expiry walk (ZFS_PRESAGE_EXPIRE) is
+ * after held headers only, and a held header means a cached dbuf, so it
+ * visits the indirects that are cached and reads nothing.
+ */
+static int
+dmu_presage_walk(dnode_t *dn, dmu_presage_arg_t *dap, uint64_t offset,
+    uint64_t len)
+{
+	boolean_t mark = !(dap->dap_flags & (ZFS_PRESAGE_RELEASE |
+	    ZFS_PRESAGE_STATUS | ZFS_PRESAGE_EXPIRE));
+	boolean_t expire = (dap->dap_flags & ZFS_PRESAGE_EXPIRE) != 0;
+	boolean_t forget = !expire && (dap->dap_flags &
+	    (ZFS_PRESAGE_RELEASE | ZFS_PRESAGE_RESET)) != 0;
+	uint32_t ceiling = (dap->dap_flags & ZFS_PRESAGE_RELEASE) ? 0 :
+	    dap->dap_deadline;
+	int err = 0;
+
+	rw_enter(&dn->dn_struct_rwlock, RW_READER);
+	uint64_t start = dbuf_whichblock(dn, 0, offset);
+	uint64_t end = dbuf_whichblock(dn, 0, offset + len - 1) + 1;
+	int epbs = dn->dn_indblkshift - SPA_BLKPTRSHIFT;
+
+	if (dn->dn_nlevels == 1) {
+		for (uint64_t b = start; b < end && b < dn->dn_nblkptr; b++) {
+			err = dmu_presage_bp(dap, &dn->dn_phys->dn_blkptr[b],
+			    B_TRUE, mark && dmu_presage_rewriting(dn, b));
+			if (forget)
+				dmu_presage_forget_blkid(dn, b, ceiling);
+			if (err != 0)
+				break;
+		}
+	} else {
+		for (uint64_t l1 = start >> epbs;
+		    l1 <= (end - 1) >> epbs && err == 0; l1++) {
+			if (issig()) {
+				err = SET_ERROR(EINTR);
+				break;
+			}
+			dmu_buf_impl_t *db = NULL;
+			if (expire) {
+				if (dbuf_hold_impl(dn, 1, l1, B_TRUE, B_TRUE,
+				    FTAG, &db) != 0)
+					continue;
+			} else {
+				db = dbuf_hold_level(dn, 1, l1, FTAG);
+			}
+			if (db == NULL)
+				continue;
+			if (dbuf_read(db, NULL, DB_RF_CANFAIL |
+			    DB_RF_NOPREFETCH | DB_RF_HAVESTRUCT) == 0) {
+				if (db->db_blkptr != NULL)
+					(void) dmu_presage_bp(dap,
+					    db->db_blkptr, B_FALSE, B_FALSE);
+				if (forget) {
+					mutex_enter(&db->db_mtx);
+					dmu_presage_forget(db, ceiling);
+					mutex_exit(&db->db_mtx);
+				}
+				blkptr_t *bps = db->db.db_data;
+				uint64_t lo = MAX(start, l1 << epbs);
+				uint64_t hi = MIN(end, (l1 + 1) << epbs);
+				for (uint64_t b = lo; b < hi && err == 0; b++) {
+					err = dmu_presage_bp(dap,
+					    &bps[b - (l1 << epbs)], B_TRUE,
+					    mark &&
+					    dmu_presage_rewriting(dn, b));
+					if (forget)
+						dmu_presage_forget_blkid(dn,
+						    b, ceiling);
+				}
+			}
+			dbuf_rele(db, FTAG);
+		}
+	}
+	rw_exit(&dn->dn_struct_rwlock);
+	return (err);
+}
+
+/* Load this much at a time; the presage cap is checked before each chunk. */
+#define	DMU_PRESAGE_CHUNK	(64ULL << 20)
+
+/*
+ * Load [offset, offset + len) of an object into ARC and move every block on
+ * the path (dnode block, L1 indirects, L0 data) into the presage state until
+ * deadline (absolute, see arc_presage_deadline()); or release / report the
+ * range.  Loading reuses
+ * dmu_prefetch_wait() a chunk at a time, so L0 data is not decompressed, no
+ * L0 dbufs are created, and a range larger than the remaining presage cap
+ * stops with ENOSPC after at most one chunk past it rather than reading it
+ * all.  Byte counts are logical sizes.  The dataset's primarycache property
+ * is honoured: with primarycache=metadata the data blocks are neither loaded
+ * nor marked (status reports them uncached), with primarycache=none nothing
+ * is.
+ */
+int
+dmu_presage(objset_t *os, uint64_t object, uint64_t offset, uint64_t len,
+    uint32_t deadline, uint32_t flags, uint64_t *pinned, uint64_t *cached,
+    uint64_t *uncached)
+{
+	dmu_presage_arg_t dap = { dmu_objset_spa(os), deadline, flags,
+	    os->os_primary_cache == ZFS_CACHE_ALL,
+	    os->os_primary_cache != ZFS_CACHE_NONE, 0, 0, 0 };
+	boolean_t load = dap.dap_data && !(flags & (ZFS_PRESAGE_RELEASE |
+	    ZFS_PRESAGE_STATUS | ZFS_PRESAGE_EXPIRE));
+	dnode_t *dn;
+	int err;
+
+	err = dnode_hold(os, object, FTAG, &dn);
+	if (err != 0)
+		return (err);
+
+	/*
+	 * The dnode block itself (meta-dnode L0).  A file being written has
+	 * it dirty in most transaction groups, so a release or replacement
+	 * treats it like the other dirty blocks on the path.
+	 */
+	if (dn->dn_dbuf != NULL && dn->dn_dbuf->db_blkptr != NULL)
+		(void) dmu_presage_bp(&dap, dn->dn_dbuf->db_blkptr, B_FALSE,
+		    B_FALSE);
+	if (dn->dn_dbuf != NULL && (flags & (ZFS_PRESAGE_RELEASE |
+	    ZFS_PRESAGE_RESET)) && !(flags & ZFS_PRESAGE_EXPIRE)) {
+		mutex_enter(&dn->dn_dbuf->db_mtx);
+		dmu_presage_forget(dn->dn_dbuf,
+		    (flags & ZFS_PRESAGE_RELEASE) ? 0 : deadline);
+		mutex_exit(&dn->dn_dbuf->db_mtx);
+	}
+
+	for (uint64_t off = offset, mylen; off < offset + len && err == 0;
+	    off += mylen) {
+		if (load) {
+			/*
+			 * Skip holes using the indirect blocks, so a sparse
+			 * object (a thin zvol, a file with a far-off EOF)
+			 * costs a prefetch call per existing block, not per
+			 * absent one.  Blocks written but not yet synced look
+			 * like holes here; the active reservation's re-sweep
+			 * picks them up once they have DVAs.
+			 */
+			uint64_t next = off;
+			err = dnode_next_offset(dn, 0, &next, 1, 1, 0);
+			if (err == ESRCH) {
+				err = 0;
+				break;
+			}
+			if (err != 0 || next >= offset + len)
+				break;
+			off = next;
+		}
+		mylen = MIN(DMU_PRESAGE_CHUNK, offset + len - off);
+		if (load) {
+			if (arc_presage_room() == 0) {
+				err = SET_ERROR(ENOSPC);
+				break;
+			}
+			err = dmu_prefetch_wait(os, object, off, mylen);
+			if (err != 0)
+				break;
+		}
+		err = dmu_presage_walk(dn, &dap, off, mylen);
+	}
+	dnode_rele(dn, FTAG);
+
+	*pinned = dap.dap_pinned;
+	*cached = dap.dap_cached;
+	*uncached = dap.dap_uncached;
+	return (err);
+}
+
 /*
  * Issue prefetch I/Os for the given object's dnode.
  */

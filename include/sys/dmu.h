@@ -951,6 +951,9 @@ void dmu_prefetch_user(objset_t *os, uint64_t object, int64_t level,
 void dmu_prefetch_by_dnode(dnode_t *dn, int64_t level, uint64_t offset,
 	uint64_t len, enum zio_priority pri);
 void dmu_prefetch_dnode(objset_t *os, uint64_t object, enum zio_priority pri);
+int dmu_presage(objset_t *os, uint64_t object, uint64_t offset,
+    uint64_t len, uint32_t deadline, uint32_t flags, uint64_t *pinned,
+    uint64_t *cached, uint64_t *uncached);
 int dmu_prefetch_wait(objset_t *os, uint64_t object, uint64_t offset,
     uint64_t size);
 void dmu_prefetch_stream(objset_t *os, uint64_t object, uint64_t offset,

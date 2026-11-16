@@ -157,6 +157,7 @@
 #include <sys/cmn_err.h>
 #include <sys/stat.h>
 #include <sys/zfs_ioctl.h>
+#include <sys/zfs_presage.h>
 #include <sys/zfs_quota.h>
 #include <sys/zfs_vfsops.h>
 #include <sys/zfs_znode.h>
@@ -1286,6 +1287,22 @@ zfs_secpolicy_config(zfs_cmd_t *zc, nvlist_t *innvl, cred_t *cr)
 		return (SET_ERROR(EPERM));
 
 	return (0);
+}
+
+/*
+ * Policy for ZFS_IOC_PRESAGE_DATASET: status needs read access to the
+ * dataset, making or killing a reservation needs the system configuration
+ * privilege, the same rule the file-descriptor form applies.
+ */
+static int
+zfs_secpolicy_presage(zfs_cmd_t *zc, nvlist_t *innvl, cred_t *cr)
+{
+	uint64_t flags = 0;
+
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_FLAGS, &flags);
+	if (flags & ZFS_PRESAGE_STATUS)
+		return (zfs_secpolicy_read(zc, innvl, cr));
+	return (zfs_secpolicy_config(zc, innvl, cr));
 }
 
 /*
@@ -5105,6 +5122,65 @@ zfs_ioc_wait_fs(const char *name, nvlist_t *innvl, nvlist_t *outnvl)
 }
 
 /*
+ * Presage a volume by name: the dataset-named form of ZFS_IOC_PRESAGE,
+ * for datasets that cannot be opened as files.  Only volumes are accepted;
+ * a filesystem or snapshot name fails with EINVAL.
+ *
+ * innvl: {
+ *     "offset" -> uint64_t (optional, default 0)
+ *     "length" -> uint64_t (optional, 0 = to volsize)
+ *     "start" -> uint64_t (optional, epoch seconds, 0 = now)
+ *     "ttl" -> uint64_t (optional, seconds; 0 kills)
+ *     "flags" -> uint64_t (optional, ZFS_PRESAGE_STATUS)
+ * }
+ *
+ * outnvl: {
+ *     "presaged" -> uint64_t
+ *     "cached" -> uint64_t
+ *     "uncached" -> uint64_t
+ *     "pending" -> uint64_t
+ *     "warmed_at" -> uint64_t
+ *     "expires_at" -> uint64_t
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_presage_dataset[] = {
+	{ZFS_PRESAGE_NV_OFFSET,	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{ZFS_PRESAGE_NV_LENGTH,	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{ZFS_PRESAGE_NV_START,	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{ZFS_PRESAGE_NV_TTL,	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+	{ZFS_PRESAGE_NV_FLAGS,	DATA_TYPE_UINT64,	ZK_OPTIONAL},
+};
+
+static int
+zfs_ioc_presage_dataset(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	zfs_presage_args_t args;
+	int error;
+
+	memset(&args, 0, sizeof (args));
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_OFFSET, &args.off);
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_LENGTH, &args.len);
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_START, &args.start);
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_TTL, &args.ttl);
+	(void) nvlist_lookup_uint64(innvl, ZFS_PRESAGE_NV_FLAGS, &args.flags);
+	if ((args.flags & ~ZFS_PRESAGE_STATUS) != 0)
+		return (SET_ERROR(EINVAL));
+
+	error = zfs_presage_dataset(dsname, &args);
+	if (error != 0)
+		return (error);
+
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_PRESAGED, args.presaged);
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_CACHED, args.cached);
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_UNCACHED, args.uncached);
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_PENDING, args.pending);
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_WARMED_AT, args.warmed_at);
+	fnvlist_add_uint64(outnvl, ZFS_PRESAGE_NV_EXPIRES_AT,
+	    args.expires_at);
+	return (0);
+}
+
+/*
  * fsname is name of dataset to rollback (to most recent snapshot)
  *
  * innvl may contain name of expected target snapshot
@@ -5121,7 +5197,9 @@ zfs_ioc_rollback(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 {
 	zfsvfs_t *zfsvfs;
 	zvol_state_handle_t *zv;
+	zfs_presage_fence_t *prs;
 	const char *target = NULL;
+	boolean_t restored;
 	int error;
 
 	(void) nvlist_lookup_string(innvl, "target", &target);
@@ -5137,16 +5215,20 @@ zfs_ioc_rollback(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 			return (SET_ERROR(EINVAL));
 	}
 
+	/* Presage reservations on the dataset stand still for the restore. */
+	prs = zfs_presage_restore_begin(fsname);
 	if (getzfsvfs(fsname, &zfsvfs) == 0) {
 		dsl_dataset_t *ds;
 
 		ds = dmu_objset_ds(zfsvfs->z_os);
 		error = zfs_suspend_fs(zfsvfs);
+		restored = B_FALSE;
 		if (error == 0) {
 			int resume_err;
 
 			error = dsl_dataset_rollback(fsname, target, zfsvfs,
 			    outnvl);
+			restored = (error == 0);
 			resume_err = zfs_resume_fs(zfsvfs, ds);
 			error = error ? error : resume_err;
 		}
@@ -5154,10 +5236,14 @@ zfs_ioc_rollback(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 	} else if (zvol_suspend(fsname, &zv) == 0) {
 		error = dsl_dataset_rollback(fsname, target, zvol_tag(zv),
 		    outnvl);
+		restored = (error == 0);
 		zvol_resume(zv);
 	} else {
 		error = dsl_dataset_rollback(fsname, target, NULL, outnvl);
+		restored = (error == 0);
 	}
+	/* Restored: they are released; the admin asks again afterwards. */
+	zfs_presage_restore_end(prs, restored);
 	return (error);
 }
 
@@ -5886,7 +5972,14 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, const char *origin,
 	if (error == 0) {
 		zfsvfs_t *zfsvfs = NULL;
 		zvol_state_handle_t *zv = NULL;
+		zfs_presage_fence_t *prs;
+		boolean_t swapped;
 
+		/*
+		 * A receive into an existing dataset replaces its contents
+		 * the way a rollback does; see zfs_ioc_rollback().
+		 */
+		prs = zfs_presage_restore_begin(tofs);
 		if (getzfsvfs(tofs, &zfsvfs) == 0) {
 			/* online recv */
 			dsl_dataset_t *ds;
@@ -5902,6 +5995,7 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, const char *origin,
 			 * likely also fail, and clean up after itself.
 			 */
 			end_err = dmu_recv_end(&drc, zfsvfs);
+			swapped = (end_err == 0);
 			/*
 			 * If the dataset was not redacted, but we received a
 			 * redacted stream onto it, we need to unmount the
@@ -5917,10 +6011,13 @@ zfs_ioc_recv_impl(char *tofs, char *tosnap, const char *origin,
 			zfs_vfs_rele(zfsvfs);
 		} else if (zvol_suspend(tofs, &zv) == 0) {
 			error = dmu_recv_end(&drc, zvol_tag(zv));
+			swapped = (error == 0);
 			zvol_resume(zv);
 		} else {
 			error = dmu_recv_end(&drc, NULL);
+			swapped = (error == 0);
 		}
+		zfs_presage_restore_end(prs, swapped && !drc.drc_newfs);
 
 		/* Set delayed properties now, after we're done receiving. */
 		if (recv_delayprops != NULL && error == 0) {
@@ -7818,6 +7915,7 @@ static int
 zfs_ioc_unload_key(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
 {
 	(void) innvl, (void) outnvl;
+	zfs_presage_fence_t *prf;
 	int ret = 0;
 
 	if (strchr(dsname, '@') != NULL || strchr(dsname, '%') != NULL) {
@@ -7825,7 +7923,13 @@ zfs_ioc_unload_key(const char *dsname, nvlist_t *innvl, nvlist_t *outnvl)
 		goto out;
 	}
 
+	/*
+	 * Nothing decrypted stays presaged behind an unloaded key, and
+	 * nothing under it is loaded until the unload is over.
+	 */
+	prf = zfs_presage_unload_key(dsname);
 	ret = spa_keystore_unload_wkey(dsname);
+	zfs_presage_unload_key_end(prf);
 	if (ret != 0)
 		goto out;
 
@@ -8169,6 +8273,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_wait_fs, zfs_secpolicy_none, DATASET_NAME,
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_FALSE,
 	    zfs_keys_fs_wait, ARRAY_SIZE(zfs_keys_fs_wait));
+
+	zfs_ioctl_register("presage", ZFS_IOC_PRESAGE_DATASET,
+	    zfs_ioc_presage_dataset, zfs_secpolicy_presage, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_presage_dataset, ARRAY_SIZE(zfs_keys_presage_dataset));
 
 	zfs_ioctl_register("set_bootenv", ZFS_IOC_SET_BOOTENV,
 	    zfs_ioc_set_bootenv, zfs_secpolicy_config, POOL_NAME,
@@ -8834,6 +8943,7 @@ zfs_kmod_init(void)
 	zfs_init();
 
 	zfs_ioctl_init();
+	zfs_presage_init();
 
 	/* Register zoned_uid property lookup callback with SPL */
 	zone_register_zoned_uid_callback(zfs_get_zoned_uid);
@@ -8849,6 +8959,7 @@ zfs_kmod_init(void)
 
 	return (0);
 out:
+	zfs_presage_fini();
 	zfs_fini();
 	spa_fini();
 	zvol_fini();
@@ -8875,6 +8986,7 @@ zfs_kmod_fini(void)
 			kmem_free(zs, sizeof (zfsdev_state_t));
 	}
 
+	zfs_presage_fini();
 	zfs_ereport_taskq_fini();	/* run before zfs_fini() on Linux */
 
 	/* Unregister zoned_uid callback before ZFS layer is torn down */
