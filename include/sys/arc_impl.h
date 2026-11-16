@@ -73,6 +73,7 @@ typedef struct l2arc_info {
  *	ARC_mfu		- frequently used, currently cached
  *	ARC_mfu_ghost	- frequently used, no longer in cache
  *	ARC_uncached	- uncacheable prefetch, to be evicted
+ *	ARC_presaged		- owner-directed residency with a TTL
  *	ARC_l2c_only	- exists in L2ARC but not other states
  * When there are no active references to the buffer, they are
  * are linked onto a list in one of these arc states.  These are
@@ -195,6 +196,15 @@ typedef struct l1arc_buf_hdr {
 	uint32_t		b_mfu_hits;
 	uint32_t		b_mfu_ghost_hits;
 	uint8_t			b_byteswap;
+	/*
+	 * presage expiry, in seconds since boot.  Meaningful while
+	 * b_state == arc_presaged, and kept through arc_release() so that a
+	 * block rewritten in place returns to the state when its write
+	 * completes (arc_presage_inherit()); 0 or a past value otherwise.
+	 * Fills existing padding between b_byteswap and b_buf, so
+	 * sizeof (l1arc_buf_hdr_t) stays 88 bytes on LP64.
+	 */
+	uint32_t		b_presage_expire;
 	arc_buf_t		*b_buf;
 
 	/* self protecting */
@@ -824,6 +834,28 @@ typedef struct arc_stats {
 	kstat_named_t arcstat_uncached_evictable_metadata;
 	/* Number of L2ARC devices currently attached across all pools. */
 	kstat_named_t arcstat_l2_ndev;
+	/*
+	 * Bytes held in the presaged (owner-directed residency) state, which
+	 * arc_evict() never takes from.  "evictable" here means "will be
+	 * demoted to MFU when its TTL expires or the presage cap shrinks".
+	 * presaged_counted is the part of presaged_size that is compared
+	 * with the cap: the presaged blocks themselves, without the copies
+	 * of them that cached dbufs hold.  presaged_limit is the cap, in
+	 * bytes, as it stands now (it follows the ARC target).
+	 */
+	kstat_named_t arcstat_presaged_size;
+	kstat_named_t arcstat_presaged_counted;
+	kstat_named_t arcstat_presaged_limit;
+	kstat_named_t arcstat_presaged_data;
+	kstat_named_t arcstat_presaged_metadata;
+	kstat_named_t arcstat_presaged_evictable_data;
+	kstat_named_t arcstat_presaged_evictable_metadata;
+	kstat_named_t arcstat_presaged_hits;
+	kstat_named_t arcstat_presaged_expired;
+	kstat_named_t arcstat_presaged_demoted_cap;
+	kstat_named_t arcstat_presaged_inherited;
+	kstat_named_t arcstat_presaged_lookups;
+	kstat_named_t arcstat_presaged_inherited_lookup;
 	kstat_named_t arcstat_l2_hits;
 	kstat_named_t arcstat_l2_misses;
 	/*
@@ -978,6 +1010,12 @@ typedef struct arc_sums {
 	wmsum_t arcstat_mfu_hits;
 	wmsum_t arcstat_mfu_ghost_hits;
 	wmsum_t arcstat_uncached_hits;
+	wmsum_t arcstat_presaged_hits;
+	wmsum_t arcstat_presaged_expired;
+	wmsum_t arcstat_presaged_demoted_cap;
+	wmsum_t arcstat_presaged_inherited;
+	wmsum_t arcstat_presaged_lookups;
+	wmsum_t arcstat_presaged_inherited_lookup;
 	wmsum_t arcstat_deleted;
 	wmsum_t arcstat_mutex_miss;
 	wmsum_t arcstat_access_skip;
@@ -1088,6 +1126,7 @@ typedef struct arc_evict_waiter {
 #define	arc_mfu_ghost	(&ARC_mfu_ghost)
 #define	arc_l2c_only	(&ARC_l2c_only)
 #define	arc_uncached	(&ARC_uncached)
+#define	arc_presaged		(&ARC_presaged)
 
 extern taskq_t *arc_prune_taskq;
 extern arc_stats_t arc_stats;
@@ -1101,7 +1140,9 @@ extern kmutex_t arc_prune_mtx;
 extern list_t arc_prune_list;
 extern arc_state_t	ARC_mfu;
 extern arc_state_t	ARC_mru;
+extern arc_state_t	ARC_presaged;
 extern uint_t zfs_arc_pc_percent;
+extern uint_t zfs_arc_presaged_max_percent;
 extern uint_t arc_lotsfree_percent;
 extern uint64_t zfs_arc_min;
 extern uint64_t zfs_arc_max;

@@ -224,6 +224,7 @@ typedef enum arc_state_type {
 	ARC_STATE_MFU_GHOST,
 	ARC_STATE_L2C_ONLY,
 	ARC_STATE_UNCACHED,
+	ARC_STATE_PRESAGED,		/* owner-directed residency with TTL */
 	ARC_STATE_NUMTYPES
 } arc_state_type_t;
 
@@ -255,6 +256,7 @@ typedef struct arc_buf_info {
 #define	ARC_CACHED_IN_MRU	(1U << 2)
 #define	ARC_CACHED_IN_MFU	(1U << 3)
 #define	ARC_CACHED_IN_L2	(1U << 4)
+#define	ARC_CACHED_IN_PRESAGED	(1U << 5)
 
 void arc_space_consume(uint64_t space, arc_space_type_t type);
 void arc_space_return(uint64_t space, arc_space_type_t type);
@@ -317,6 +319,18 @@ arc_prune_t *arc_add_prune_callback(arc_prune_func_t *func, void *priv);
 void arc_remove_prune_callback(arc_prune_t *p);
 void arc_freed(spa_t *spa, const blkptr_t *bp);
 int arc_cached(spa_t *spa, const blkptr_t *bp);
+boolean_t arc_presage_enabled(void);
+uint64_t arc_presage_room(void);
+uint32_t arc_presage_deadline(uint32_t ttl_sec);
+int arc_presage_mark(spa_t *spa, const blkptr_t *bp, uint32_t deadline,
+    uint32_t flags, uint64_t *marked);
+void arc_presage_freed(spa_t *spa, const blkptr_t *bp);
+void arc_presage_inherit_lookup(spa_t *spa, const blkptr_t *obp,
+    arc_buf_t *buf);
+void arc_presage_forget(arc_buf_t *buf, uint32_t deadline);
+void arc_presage_lower(spa_t *spa, const blkptr_t *bp, uint32_t deadline);
+void arc_presage_inherit_override(spa_t *spa, const blkptr_t *obp,
+    const blkptr_t *nbp);
 
 void arc_flush(spa_t *spa, boolean_t retry);
 void arc_flush_async(spa_t *spa);

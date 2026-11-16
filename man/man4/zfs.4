@@ -995,6 +995,35 @@ will default to consuming the larger of
 and
 .Sy all_system_memory No / Sy 32 .
 .
+.It Sy zfs_arc_presaged_max_percent Ns = Ns Sy 0 Ns % Pq uint
+Upper bound, as a percentage of the current ARC target size
+.Pq Sy c ,
+on data and metadata held in the presaged (owner-directed residency) state by
+.Nm zfs Cm presage .
+Copies of presaged blocks held by the dbuf cache are not counted.
+.Sy 0
+disables presage: new requests are refused, and within seconds every
+reservation is cancelled and what it had presaged is released.
+Values above
+.Sy 90
+are treated as
+.Sy 90 .
+The bound follows the target: when memory pressure or a lower
+.Sy zfs_arc_max
+shrinks the target, the presaged data above the new, smaller bound is
+demoted within about one second to the most recently used end of the MFU
+state, and is then evicted like other MFU data.
+Until the system first runs short of memory after the module is loaded,
+the percentage is taken of the ARC's boot-time target, halfway between
+.Sy c
+and
+.Sy c_max ,
+rather than of
+.Sy c ,
+which starts small and grows only as the ARC fills.
+See
+.Xr zfs-presage 8 .
+.
 .It Sy zfs_arc_min_prefetch_ms Ns = Ns Sy 0 Ns ms Ns Po Ns ≡ Ns 1s Pc Pq uint
 Minimum time prefetched blocks are locked in the ARC.
 .

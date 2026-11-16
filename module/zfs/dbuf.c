@@ -5557,6 +5557,18 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 		 */
 		uint64_t size = 0;
 
+		/*
+		 * The copy this write replaces may still be presaged in the
+		 * ARC under its own header: the new copy was written in open
+		 * context, when the file still pointed at the old one, and
+		 * could not take its deadline over.  Move it now, and take
+		 * the old copy out of the presaged state, where a snapshot
+		 * would otherwise keep it.  (A nopwrite keeps the block.)
+		 */
+		if (!dr->dt.dl.dr_nopwrite)
+			arc_presage_inherit_override(os->os_spa,
+			    &dr->dr_bp_copy, obp);
+
 		if (data != NULL) {
 			/* The live dbuf may have a newer size. */
 			size = arc_buf_size(data);
@@ -5596,6 +5608,18 @@ dbuf_write(dbuf_dirty_record_t *dr, arc_buf_t *data, dmu_tx_t *tx)
 		arc_write_done_func_t *children_ready_cb = NULL;
 		if (db->db_level != 0)
 			children_ready_cb = dbuf_write_children_ready;
+
+		/*
+		 * The old copy of this block may still be presaged in the
+		 * ARC under its own header: a data block whose buffer is
+		 * new (dbuf_noread() on a dbuf that had left the dbuf
+		 * cache), or a block of any level whose header another
+		 * buffer shares (a reader of a snapshot), which
+		 * arc_release() leaves behind.  Carry that deadline over
+		 * before the write so the new copy inherits it and the old
+		 * one, which a snapshot may keep, does not stay presaged.
+		 */
+		arc_presage_inherit_lookup(os->os_spa, &dr->dr_bp_copy, data);
 
 		dr->dr_zio = arc_write(pio, os->os_spa, txg,
 		    &dr->dr_bp_copy, data, !DBUF_IS_CACHEABLE(db),

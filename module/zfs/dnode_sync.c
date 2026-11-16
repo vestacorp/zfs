@@ -134,6 +134,8 @@ free_blocks(dnode_t *dn, blkptr_t *bp, int num, dmu_tx_t *tx)
 		if (BP_IS_HOLE(bp))
 			continue;
 
+		/* A snapshot may keep the block; its presage ends here. */
+		arc_presage_freed(dn->dn_objset->os_spa, bp);
 		bytesfreed += dsl_dataset_block_kill(ds, bp, tx, B_FALSE);
 		ASSERT3U(bytesfreed, <=, DN_USED_BYTES(dn->dn_phys));
 

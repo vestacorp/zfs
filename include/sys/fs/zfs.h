@@ -1790,6 +1790,47 @@ typedef struct zfs_rewrite_args {
 #define	ZFS_IOC_REWRITE		_IOW(0x83, 3, zfs_rewrite_args_t)
 
 /*
+ * Ask the ARC to keep [off, off + len) of an open file resident for ttl
+ * seconds (presage: user-requested residency).  len == 0 means "to EOF".
+ * A request or a kill needs privilege; status only needs the file open.
+ * ZFS_PRESAGE_STATUS is the one flag an ioctl caller may set.  The others
+ * are for dmu_presage() and are refused from user space with EINVAL.
+ */
+#define	ZFS_PRESAGE_RELEASE	(1U << 0)	/* in-kernel: release now */
+#define	ZFS_PRESAGE_STATUS	(1U << 1)	/* report only */
+/* In-kernel: a replacement sets the deadline instead of raising it. */
+#define	ZFS_PRESAGE_RESET	(1U << 2)
+/* In-kernel: only demote headers whose deadline has passed. */
+#define	ZFS_PRESAGE_EXPIRE	(1U << 3)
+
+/*
+ * One request is (range, start, ttl).  start is wall-clock seconds (UTC
+ * epoch), 0 = now.  ttl is seconds; ttl == 0 with start == 0 kills the
+ * reservations on the file, ttl == 0 with start != 0 cancels pending ones
+ * from that time on.  The CLI supplies the default TTL; the kernel has none.
+ */
+typedef struct zfs_presage_args {
+	uint64_t	off;
+	uint64_t	len;		/* 0 = to end of file */
+	uint64_t	start;		/* in: epoch seconds, 0 = now */
+	uint64_t	ttl;		/* in: seconds */
+	uint64_t	flags;		/* in: ZFS_PRESAGE_STATUS */
+	uint64_t	presaged;	/* out: bytes in the presaged state */
+	uint64_t	cached;		/* out: bytes in ARC, any other state */
+	uint64_t	uncached;	/* out: bytes not in ARC */
+	uint64_t	pending;	/* out: reservations not yet started */
+	uint64_t	warmed_at;	/* out: epoch seconds, 0 if never */
+	uint64_t	expires_at;	/* out: epoch seconds, latest expiry */
+	/*
+	 * Must be 0: the kernel refuses any non-zero word with EINVAL,
+	 * so fields added here later are refused cleanly by older kernels.
+	 */
+	uint64_t	reserved[4];
+} zfs_presage_args_t;
+
+#define	ZFS_IOC_PRESAGE		_IOWR(0x83, 4, zfs_presage_args_t)
+
+/*
  * ZFS-specific error codes used for returning descriptive errors
  * to the userland through zfs ioctls.
  *

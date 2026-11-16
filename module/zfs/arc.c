@@ -295,6 +295,7 @@
 #include <sys/zthr.h>
 #include <zfs_fletcher.h>
 #include <sys/arc_impl.h>
+#include <sys/fs/zfs.h>
 #include <sys/trace_zfs.h>
 #include <sys/aggsum.h>
 #include <sys/wmsum.h>
@@ -324,6 +325,13 @@ static arc_buf_hdr_t **arc_state_evict_markers;
 static int arc_state_evict_marker_count;
 
 static kmutex_t arc_evict_lock;
+/*
+ * Orders arc_presage_forget() against arc_presage_inherit(): the first
+ * changes the deadline an anonymous header carries, the second reads it
+ * and moves the header into the hash table's care.  Inheritors share the
+ * lock; a release or replacement that found a dirty buffer excludes them.
+ */
+static krwlock_t arc_presage_inherit_lock;
 static boolean_t arc_evict_needed = B_FALSE;
 static clock_t arc_last_uncached_flush;
 
@@ -492,6 +500,39 @@ static arc_state_t ARC_mru_ghost;
 static arc_state_t ARC_mfu_ghost;
 static arc_state_t ARC_l2c_only;
 static arc_state_t ARC_uncached;
+/*  */ arc_state_t ARC_presaged;
+/*
+ * presaged (owner-directed residency): blocks a privileged user asked to keep
+ * in ARC until a deadline.  Capped at zfs_arc_presaged_max_percent of the
+ * ARC target (see arc_presage_cap()); 0 disables the feature.  When the
+ * cap shrinks (memory pressure lowers arc_c) the listed presaged headers
+ * over it are demoted to MFU, oldest first in each sublist, where normal
+ * eviction applies.
+ */
+uint_t zfs_arc_presaged_max_percent = 0;
+#define	ARC_PRESAGE_MAX_TTL	(30 * 24 * 3600)	/* seconds */
+static uint32_t arc_presage_next_expire = UINT32_MAX;
+/*
+ * Bytes of arc_presaged's size that its headers own (b_pabd and b_rabd),
+ * as opposed to the copies that buffers attached to cached dbufs own.
+ * This is what the cap bounds: an owner who presages a file and then reads
+ * it must not lose blocks of it to the copies the read makes.  Kept beside
+ * every change of the state's size that is charged to a header.
+ */
+static uint64_t arc_presage_counted_bytes;
+
+static inline void
+arc_presage_count(const arc_state_t *state, int64_t delta)
+{
+	if (state == arc_presaged) {
+		uint64_t nv = atomic_add_64_nv(&arc_presage_counted_bytes,
+		    delta);
+		ASSERT3U(nv, <, 1ULL << 62);	/* no wrap below zero */
+		(void) nv;
+	}
+}
+static boolean_t arc_presage_demote_expired(arc_buf_hdr_t *);
+static void arc_presage_arm(uint32_t);
 
 arc_stats_t arc_stats = {
 	{ "hits",			KSTAT_DATA_UINT64 },
@@ -580,6 +621,19 @@ arc_stats_t arc_stats = {
 	{ "uncached_evictable_data",	KSTAT_DATA_UINT64 },
 	{ "uncached_evictable_metadata", KSTAT_DATA_UINT64 },
 	{ "l2_ndev",			KSTAT_DATA_UINT64 },
+	{ "presaged_size",			KSTAT_DATA_UINT64 },
+	{ "presaged_counted",		KSTAT_DATA_UINT64 },
+	{ "presaged_limit",		KSTAT_DATA_UINT64 },
+	{ "presaged_data",			KSTAT_DATA_UINT64 },
+	{ "presaged_metadata",		KSTAT_DATA_UINT64 },
+	{ "presaged_evictable_data",		KSTAT_DATA_UINT64 },
+	{ "presaged_evictable_metadata",	KSTAT_DATA_UINT64 },
+	{ "presaged_hits",			KSTAT_DATA_UINT64 },
+	{ "presaged_expired",		KSTAT_DATA_UINT64 },
+	{ "presaged_demoted_cap",		KSTAT_DATA_UINT64 },
+	{ "presaged_inherited",		KSTAT_DATA_UINT64 },
+	{ "presaged_lookups",		KSTAT_DATA_UINT64 },
+	{ "presaged_inherited_lookup",	KSTAT_DATA_UINT64 },
 	{ "l2_hits",			KSTAT_DATA_UINT64 },
 	{ "l2_misses",			KSTAT_DATA_UINT64 },
 	{ "l2_prefetch_asize",		KSTAT_DATA_UINT64 },
@@ -2382,8 +2436,24 @@ remove_reference(arc_buf_hdr_t *hdr, const void *tag)
 		arc_hdr_destroy(hdr);
 		return (0);
 	}
+	/*
+	 * An expired presage header whose last hold just dropped: with the
+	 * refcount at zero, arc_change_state() has already put it on the MFU
+	 * list and counted it evictable, so there is nothing left to insert.
+	 */
+	if (state == arc_presaged) {
+		if (arc_presage_demote_expired(hdr))
+			return (0);
+	}
 	multilist_insert(&state->arcs_list[arc_buf_type(hdr)], hdr);
 	arc_evictable_space_increment(hdr, state);
+	/*
+	 * Off the list while held; arm its deadline now that it is listed.
+	 * (Armed first, a reaper pass between the two steps would clear the
+	 * arm and not find the header.)
+	 */
+	if (state == arc_presaged)
+		arc_presage_arm(hdr->b_l1hdr.b_presage_expire);
 	return (0);
 }
 
@@ -2559,12 +2629,16 @@ arc_change_state(arc_state_t *new_state, arc_buf_hdr_t *hdr)
 				(void) zfs_refcount_add_many(
 				    &new_state->arcs_size[type],
 				    arc_hdr_size(hdr), hdr);
+				arc_presage_count(new_state,
+				    arc_hdr_size(hdr));
 			}
 
 			if (HDR_HAS_RABD(hdr)) {
 				(void) zfs_refcount_add_many(
 				    &new_state->arcs_size[type],
 				    HDR_GET_PSIZE(hdr), hdr);
+				arc_presage_count(new_state,
+				    HDR_GET_PSIZE(hdr));
 			}
 		}
 	}
@@ -2617,12 +2691,16 @@ arc_change_state(arc_state_t *new_state, arc_buf_hdr_t *hdr)
 				(void) zfs_refcount_remove_many(
 				    &old_state->arcs_size[type],
 				    arc_hdr_size(hdr), hdr);
+				arc_presage_count(old_state,
+				    -(int64_t)arc_hdr_size(hdr));
 			}
 
 			if (HDR_HAS_RABD(hdr)) {
 				(void) zfs_refcount_remove_many(
 				    &old_state->arcs_size[type],
 				    HDR_GET_PSIZE(hdr), hdr);
+				arc_presage_count(old_state,
+				    -(int64_t)HDR_GET_PSIZE(hdr));
 			}
 		}
 	}
@@ -2632,7 +2710,10 @@ arc_change_state(arc_state_t *new_state, arc_buf_hdr_t *hdr)
 
 		if (HDR_HAS_L2HDR(hdr) && new_state != arc_l2c_only) {
 			l2arc_hdr_arcstats_decrement_state(hdr);
-			hdr->b_l2hdr.b_arcs_state = new_state->arcs_state;
+			/* Never persist ARC_STATE_PRESAGED in L2ARC. */
+			hdr->b_l2hdr.b_arcs_state =
+			    (new_state == arc_presaged) ? ARC_STATE_MFU :
+			    new_state->arcs_state;
 			l2arc_hdr_arcstats_increment_state(hdr);
 		}
 	}
@@ -2983,6 +3064,7 @@ arc_hdr_free_on_write(arc_buf_hdr_t *hdr, boolean_t free_rdata)
 		    size, hdr);
 	}
 	(void) zfs_refcount_remove_many(&state->arcs_size[type], size, hdr);
+	arc_presage_count(state, -(int64_t)size);
 	if (type == ARC_BUFC_METADATA) {
 		arc_space_return(size, ARC_SPACE_META);
 	} else {
@@ -3025,6 +3107,7 @@ arc_share_buf(arc_buf_hdr_t *hdr, arc_buf_t *buf)
 	zfs_refcount_transfer_ownership_many(
 	    &hdr->b_l1hdr.b_state->arcs_size[arc_buf_type(hdr)],
 	    arc_hdr_size(hdr), buf, hdr);
+	arc_presage_count(hdr->b_l1hdr.b_state, arc_hdr_size(hdr));
 	hdr->b_l1hdr.b_pabd = abd_get_from_buf(buf->b_data, arc_buf_size(buf));
 	abd_take_ownership_of_buf(hdr->b_l1hdr.b_pabd,
 	    HDR_ISTYPE_METADATA(hdr));
@@ -3055,6 +3138,7 @@ arc_unshare_buf(arc_buf_hdr_t *hdr, arc_buf_t *buf)
 	zfs_refcount_transfer_ownership_many(
 	    &hdr->b_l1hdr.b_state->arcs_size[arc_buf_type(hdr)],
 	    arc_hdr_size(hdr), hdr, buf);
+	arc_presage_count(hdr->b_l1hdr.b_state, -(int64_t)arc_hdr_size(hdr));
 	arc_hdr_clear_flags(hdr, ARC_FLAG_SHARED_DATA);
 	abd_release_ownership_of_buf(hdr->b_l1hdr.b_pabd);
 	abd_free(hdr->b_l1hdr.b_pabd);
@@ -3340,6 +3424,7 @@ arc_hdr_alloc(uint64_t spa, int32_t psize, int32_t lsize,
 	hdr->b_l1hdr.b_mru_ghost_hits = 0;
 	hdr->b_l1hdr.b_mfu_hits = 0;
 	hdr->b_l1hdr.b_mfu_ghost_hits = 0;
+	hdr->b_l1hdr.b_presage_expire = 0;
 	hdr->b_l1hdr.b_buf = NULL;
 
 	ASSERT(zfs_refcount_is_zero(&hdr->b_l1hdr.b_refcnt));
@@ -3866,14 +3951,28 @@ arc_evict_hdr(arc_buf_hdr_t *hdr, uint64_t *real_evicted)
 		return (bytes_evicted);
 	}
 
-	ASSERT(state == arc_mru || state == arc_mfu || state == arc_uncached);
+	ASSERT(state == arc_mru || state == arc_mfu || state == arc_uncached ||
+	    state == arc_presaged);
 	evicted_state = (state == arc_uncached) ? arc_anon :
 	    ((state == arc_mru) ? arc_mru_ghost : arc_mfu_ghost);
+	/*
+	 * A flush is the only thing that evicts a presaged header.  Its
+	 * ghost must not keep the deadline: a ghost hit and a later rewrite
+	 * would bring the block back into the presaged state unasked.
+	 */
+	if (state == arc_presaged)
+		hdr->b_l1hdr.b_presage_expire = 0;
 
-	/* prefetch buffers have a minimum lifespan */
+	/*
+	 * Prefetch buffers have a minimum lifespan.  Not presaged ones: the
+	 * only eviction they ever see is the pool's export flush, which does
+	 * not come back for what it skipped, and a header left behind in
+	 * arc_presaged has no other way out before its deadline.
+	 */
 	uint_t min_lifetime = HDR_PRESCIENT_PREFETCH(hdr) ?
 	    arc_min_prescient_prefetch : arc_min_prefetch;
 	if ((hdr->b_flags & (ARC_FLAG_PREFETCH | ARC_FLAG_INDIRECT)) &&
+	    state != arc_presaged &&
 	    ddi_get_lbolt() - hdr->b_l1hdr.b_arc_access < min_lifetime) {
 		ARCSTAT_BUMP(arcstat_evict_skip);
 		return (bytes_evicted);
@@ -4641,6 +4740,13 @@ arc_flush_impl(uint64_t guid, boolean_t retry)
 	(void) arc_flush_state(arc_mfu, guid, ARC_BUFC_DATA, retry);
 	(void) arc_flush_state(arc_mfu, guid, ARC_BUFC_METADATA, retry);
 
+	/*
+	 * Export must not leave presaged headers of the pool behind.  They
+	 * go before the ghost lists, which then take the ghosts they made.
+	 */
+	(void) arc_flush_state(arc_presaged, guid, ARC_BUFC_DATA, retry);
+	(void) arc_flush_state(arc_presaged, guid, ARC_BUFC_METADATA, retry);
+
 	(void) arc_flush_state(arc_mru_ghost, guid, ARC_BUFC_DATA, retry);
 	(void) arc_flush_state(arc_mru_ghost, guid, ARC_BUFC_METADATA, retry);
 
@@ -4649,6 +4755,7 @@ arc_flush_impl(uint64_t guid, boolean_t retry)
 
 	(void) arc_flush_state(arc_uncached, guid, ARC_BUFC_DATA, retry);
 	(void) arc_flush_state(arc_uncached, guid, ARC_BUFC_METADATA, retry);
+
 }
 
 void
@@ -4848,6 +4955,642 @@ arc_kmem_reap_soon(void)
 	abd_cache_reap_now();
 }
 
+static inline uint32_t
+arc_presage_now(void)
+{
+	return ((uint32_t)(ddi_get_lbolt64() / hz));
+}
+
+/*
+ * Pull the reaper's next deadline forward to expire.  Callers hold a hash
+ * lock, never a common one, so this is a compare-and-swap loop; a store
+ * that would move the deadline later is never made here.
+ */
+static void
+arc_presage_arm(uint32_t expire)
+{
+	uint32_t cur;
+
+	while ((cur = arc_presage_next_expire) > expire &&
+	    atomic_cas_32(&arc_presage_next_expire, cur, expire) != cur)
+		continue;
+}
+
+/*
+ * Demote a presage header whose deadline has passed, under its hash lock.
+ * The reaper only walks the evictable lists, so a header that was held (by
+ * a cached dbuf, say) when it expired is caught here instead: when it is
+ * next looked at or when its last hold drops.  Returns B_TRUE if demoted.
+ */
+static boolean_t
+arc_presage_demote_expired(arc_buf_hdr_t *hdr)
+{
+	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
+	if (hdr->b_l1hdr.b_state != arc_presaged || HDR_IO_IN_PROGRESS(hdr) ||
+	    hdr->b_l1hdr.b_presage_expire > arc_presage_now())
+		return (B_FALSE);
+	hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+	arc_change_state(arc_mfu, hdr);
+	ARCSTAT_BUMP(arcstat_presaged_expired);
+	return (B_TRUE);
+}
+
+boolean_t
+arc_presage_enabled(void)
+{
+	return (zfs_arc_presaged_max_percent != 0);
+}
+
+/*
+ * The cap: a percentage of the ARC target.  While the cache is cold the
+ * target still sits near arc_c_min for no better reason than that nothing
+ * has been read yet, so the base is arc_boot_target_bytes(), as for an
+ * explicit prefetch; once the ARC has been under pressure it is arc_c.
+ * Values above ARC_PRESAGE_MAX_PERCENT are treated as that: something must
+ * stay evictable, or the ARC could not follow its target.
+ */
+#define	ARC_PRESAGE_MAX_PERCENT	90
+
+static uint64_t
+arc_presage_cap(void)
+{
+	return (arc_boot_target_bytes() / 100 *
+	    MIN(zfs_arc_presaged_max_percent, ARC_PRESAGE_MAX_PERCENT));
+}
+
+static uint64_t
+arc_presage_size(void)
+{
+	return (zfs_refcount_count(&arc_presaged->arcs_size[ARC_BUFC_DATA]) +
+	    zfs_refcount_count(&arc_presaged->arcs_size[ARC_BUFC_METADATA]));
+}
+
+/*
+ * What a header adds to the count when it enters the state: what
+ * arc_change_state() charges to the header, its b_pabd and, for an
+ * encrypted block that has it, the raw copy.
+ */
+static uint64_t
+arc_presage_hdr_charge(arc_buf_hdr_t *hdr)
+{
+	return ((hdr->b_l1hdr.b_pabd != NULL ? arc_hdr_size(hdr) : 0) +
+	    (HDR_HAS_RABD(hdr) ? HDR_GET_PSIZE(hdr) : 0));
+}
+
+/*
+ * What the cap is compared with: the presaged blocks themselves, without
+ * the copies of them held by cached dbufs (see arc_presage_count()).
+ */
+static uint64_t
+arc_presage_counted(void)
+{
+	return (atomic_load_64(&arc_presage_counted_bytes));
+}
+
+/* Bytes that may still be presaged before the cap; 0 when at or over it. */
+uint64_t
+arc_presage_room(void)
+{
+	uint64_t cap = arc_presage_cap(), sz = arc_presage_counted();
+	return (sz >= cap ? 0 : cap - sz);
+}
+
+/*
+ * A reaper pass is needed when a deadline is due, or when the state is over
+ * its cap and has headers on its lists to demote.  Held headers (a cached
+ * dbuf, I/O in flight) are on no list; when they are all that keeps the
+ * state over the cap a pass would demote nothing, and asking for one would
+ * make the eviction thread spin until the holds drop.  A header whose last
+ * hold drops is listed by remove_reference() and found by the next check.
+ */
+static boolean_t
+arc_presage_reap_needed(void)
+{
+	if (arc_presage_size() == 0)
+		return (B_FALSE);
+	if (arc_presage_now() >= arc_presage_next_expire)
+		return (B_TRUE);
+	return (arc_presage_counted() > arc_presage_cap() &&
+	    zfs_refcount_count(&arc_presaged->arcs_esize[ARC_BUFC_DATA]) +
+	    zfs_refcount_count(&arc_presaged->arcs_esize[ARC_BUFC_METADATA]) >
+	    0);
+}
+
+/*
+ * Walk one presage sublist from its tail (oldest insertion) and demote headers
+ * to MFU whose TTL has passed, or, while presage is over its cap, regardless
+ * of TTL.  Same locking pattern as arc_evict_state_impl(): sublist lock,
+ * then mutex_tryenter() on the hash lock.  Headers with holds are not on
+ * the list at all; they are handled when their last reference drops and
+ * they are reinserted (see remove_reference()).
+ */
+static uint64_t
+arc_presage_reap_sublist(multilist_t *ml, int idx, uint32_t now,
+    uint32_t *next_expire)
+{
+	uint64_t demoted = 0;
+	multilist_sublist_t *mls = multilist_sublist_lock_idx(ml, idx);
+	arc_buf_hdr_t *hdr = multilist_sublist_tail(mls);
+
+	while (hdr != NULL) {
+		arc_buf_hdr_t *prev = multilist_sublist_prev(mls, hdr);
+		kmutex_t *hash_lock = HDR_LOCK(hdr);
+
+		if (hdr->b_spa != 0 && mutex_tryenter(hash_lock)) {
+			boolean_t over =
+			    arc_presage_counted() > arc_presage_cap();
+			if (over || hdr->b_l1hdr.b_presage_expire <= now) {
+				demoted += arc_hdr_size(hdr);
+				hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+				arc_change_state(arc_mfu, hdr);
+				if (over) {
+					/*
+					 * Clear the deadline: a block demoted
+					 * for the cap must not come back by
+					 * being rewritten (arc_presage_
+					 * inherit() admits only a deadline
+					 * that is still ahead).
+					 */
+					hdr->b_l1hdr.b_presage_expire = 0;
+					ARCSTAT_BUMP(
+					    arcstat_presaged_demoted_cap);
+				} else {
+					ARCSTAT_BUMP(arcstat_presaged_expired);
+				}
+			} else {
+				*next_expire = MIN(*next_expire,
+				    hdr->b_l1hdr.b_presage_expire);
+			}
+			mutex_exit(hash_lock);
+		} else {
+			/* Skipped (lock busy or being freed): look again. */
+			*next_expire = MIN(*next_expire, now + 1);
+		}
+		hdr = prev;
+	}
+	multilist_sublist_unlock(mls);
+	return (demoted);
+}
+
+static void
+arc_presage_reap(void)
+{
+	if (!arc_presage_reap_needed())
+		return;
+
+	uint32_t now = arc_presage_now(), next = UINT32_MAX;
+
+	/*
+	 * Clear the armed deadline before the walk, so that a deadline set
+	 * while we walk (a mark, a release, a held header returning to the
+	 * list) survives the re-arm below.  Held headers are never on the
+	 * list; they are demoted on sight when accessed or released, and
+	 * remove_reference() arms their deadline when it reinserts them, so
+	 * nothing needs a periodic walk: without an expiry due or the cap
+	 * exceeded, the reaper costs nothing however much is presaged.
+	 */
+	uint32_t armed = arc_presage_next_expire;
+	(void) atomic_cas_32(&arc_presage_next_expire, armed, UINT32_MAX);
+	for (int t = 0; t < ARC_BUFC_NUMTYPES; t++) {
+		multilist_t *ml = &arc_presaged->arcs_list[t];
+		for (int i = 0; i < multilist_get_num_sublists(ml); i++)
+			(void) arc_presage_reap_sublist(ml, i, now, &next);
+	}
+	arc_presage_arm(next);
+}
+
+/*
+ * The deadline, on the clock arc_presage_mark() uses, of a request made
+ * now for ttl_sec seconds.
+ */
+uint32_t
+arc_presage_deadline(uint32_t ttl_sec)
+{
+	return (arc_presage_now() + MIN(ttl_sec, ARC_PRESAGE_MAX_TTL));
+}
+
+/*
+ * Move a cached block into the presage state until deadline, which is
+ * absolute (arc_presage_deadline()): every block of a reservation gets
+ * the reservation's deadline however long its load takes, so all of them
+ * have expired when it has.  A deadline already past marks nothing.
+ * Overlapping requests keep the later deadline (max-wins) unless
+ * ZFS_PRESAGE_RESET is set (a replaced reservation sets its new deadline;
+ * reservations that still cover the block raise it again on their next
+ * sweep).  With ZFS_PRESAGE_RELEASE the block is demoted at once (with
+ * I/O in flight, when its last hold drops).  Returns ENOENT if the block
+ * is not resident (caller should load it first), ENOSPC if the presage
+ * cap would be exceeded.
+ */
+int
+arc_presage_mark(spa_t *spa, const blkptr_t *bp, uint32_t deadline,
+    uint32_t flags, uint64_t *marked)
+{
+	kmutex_t *hash_lock;
+	int err = 0;
+
+	/*
+	 * Disabled: nothing is marked.  Demoting still works, so that what
+	 * was presaged before the tunable went to 0 can be released.
+	 */
+	if (zfs_arc_presaged_max_percent == 0 &&
+	    !(flags & (ZFS_PRESAGE_RELEASE | ZFS_PRESAGE_EXPIRE)))
+		return (SET_ERROR(ENOTSUP));
+	if (BP_IS_EMBEDDED(bp) || BP_IS_HOLE(bp))
+		return (0);
+
+	arc_buf_hdr_t *hdr = buf_hash_find(spa_load_guid(spa), bp,
+	    &hash_lock);
+	if (hdr == NULL)
+		return (SET_ERROR(ENOENT));
+
+	/*
+	 * A release must reach a presaged header even while it is under
+	 * I/O (a raw read of a block cached decrypted reuses the header):
+	 * its deadline becomes "now" and remove_reference() demotes it when
+	 * the I/O's hold drops.
+	 */
+	if ((flags & ZFS_PRESAGE_RELEASE) && HDR_HAS_L1HDR(hdr) &&
+	    hdr->b_l1hdr.b_state == arc_presaged && HDR_IO_IN_PROGRESS(hdr)) {
+		hdr->b_l1hdr.b_presage_expire = arc_presage_now();
+		*marked += arc_hdr_size(hdr);
+		goto out;
+	}
+
+	if (!HDR_HAS_L1HDR(hdr) || HDR_IO_IN_PROGRESS(hdr) ||
+	    (hdr->b_l1hdr.b_state != arc_mru &&
+	    hdr->b_l1hdr.b_state != arc_mfu &&
+	    hdr->b_l1hdr.b_state != arc_presaged)) {
+		/* Ghost, L2-only, uncached (primarycache!=all) or anon. */
+		err = SET_ERROR(ENOENT);
+		goto out;
+	}
+
+	if (flags & ZFS_PRESAGE_EXPIRE) {
+		/*
+		 * A look at a header whose reservation has expired: the
+		 * reaper never sees one that is held (a cached dbuf), so it
+		 * is demoted here if its own deadline has passed.
+		 */
+		(void) arc_presage_demote_expired(hdr);
+		goto out;
+	}
+	if (flags & ZFS_PRESAGE_RELEASE) {
+		if (hdr->b_l1hdr.b_state == arc_presaged) {
+			/*
+			 * Demote here, under the hash lock we hold.  Arming
+			 * "now" per block instead would keep the evict zthr
+			 * walking for the whole release sweep.  A header with
+			 * I/O in flight is held and is demoted when released.
+			 */
+			hdr->b_l1hdr.b_presage_expire = arc_presage_now();
+			(void) arc_presage_demote_expired(hdr);
+			*marked += arc_hdr_size(hdr);
+		}
+		goto out;
+	}
+
+	uint32_t expire = MIN(deadline,
+	    arc_presage_now() + ARC_PRESAGE_MAX_TTL);
+	if (hdr->b_l1hdr.b_state != arc_presaged) {
+		if (expire <= arc_presage_now())
+			goto out;
+		if (arc_presage_counted() + arc_presage_hdr_charge(hdr) >
+		    arc_presage_cap()) {
+			err = SET_ERROR(ENOSPC);
+			goto out;
+		}
+		hdr->b_l1hdr.b_presage_expire = expire;
+		arc_change_state(arc_presaged, hdr);
+	} else if (flags & ZFS_PRESAGE_RESET) {
+		hdr->b_l1hdr.b_presage_expire = expire;
+	} else {
+		hdr->b_l1hdr.b_presage_expire =
+		    MAX(hdr->b_l1hdr.b_presage_expire, expire);
+	}
+	/*
+	 * Drop prefetch tags on every mark, not only on entry: the load
+	 * that precedes a mark of a block already presaged (a re-sweep, a
+	 * second reservation) is a prefetch hit, and arc_access() tags the
+	 * header again.  The later demotion should land clean.
+	 */
+	if (HDR_PREFETCH(hdr) || HDR_PRESCIENT_PREFETCH(hdr)) {
+		if (HDR_HAS_L2HDR(hdr))
+			l2arc_hdr_arcstats_decrement_state(hdr);
+		arc_hdr_clear_flags(hdr,
+		    ARC_FLAG_PREFETCH | ARC_FLAG_PRESCIENT_PREFETCH);
+		if (HDR_HAS_L2HDR(hdr))
+			l2arc_hdr_arcstats_increment_state(hdr);
+	}
+	arc_presage_arm(expire);
+	*marked += arc_hdr_size(hdr);
+out:
+	mutex_exit(hash_lock);
+	return (err);
+}
+
+/*
+ * A block is leaving the live dataset: its file was truncated, punched
+ * or deleted.  It is no longer what was asked for.  If a snapshot keeps
+ * the block alive, nothing else would take its header out of the presaged
+ * state before the deadline, and a presaged file that is replaced again
+ * and again under snapshots would fill the cap with copies nobody owns;
+ * so the header is demoted here.  If nothing keeps the block, arc_freed()
+ * destroys the header in a moment anyway.  Called from dnode sync for
+ * every block freed; one comparison while nothing is presaged.
+ */
+void
+arc_presage_freed(spa_t *spa, const blkptr_t *bp)
+{
+	kmutex_t *hash_lock;
+	arc_buf_hdr_t *hdr;
+
+	if (arc_presage_size() == 0 || BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp) ||
+	    BP_IS_REDACTED(bp))
+		return;
+	hdr = buf_hash_find(spa_load_guid(spa), bp, &hash_lock);
+	if (hdr == NULL)
+		return;
+	if (HDR_HAS_L1HDR(hdr) && hdr->b_l1hdr.b_state == arc_presaged) {
+		hdr->b_l1hdr.b_presage_expire = arc_presage_now();
+		(void) arc_presage_demote_expired(hdr);
+	}
+	mutex_exit(hash_lock);
+}
+
+/*
+ * A block rewritten in place keeps its presage.  The overwritten header
+ * carries b_presage_expire through arc_release() (nothing clears it), so
+ * when its write completes and arc_write_done() would move it from anon
+ * into MRU, put it back into arc_presaged instead if the deadline is still
+ * ahead and the cap has room.  Called under the hash lock with references
+ * held (the zio's and the dbuf's): arc_change_state() leaves a held header
+ * off the sublists, exactly as for the MRU case, and remove_reference()
+ * lists it and arms its deadline when the last hold drops.
+ *
+ * Invariant: a deadline in the future means "presaged, or anon on its way
+ * back from a rewrite".  A cap demotion clears the field, an expiry or an
+ * explicit release leaves it in the past, a fresh header has it at 0, and
+ * a header turned away here has it cleared, so none of them re-enters.  A
+ * release or a replacement that finds the block dirty lowers the deadline
+ * the anonymous header carries (arc_presage_forget()).
+ *
+ * A rewrite that allocates a new buffer (a whole-record write of a block
+ * no longer in the dbuf cache) has no ancestor header of its own; the
+ * lookup in arc_presage_inherit_lookup() gives it the old block's deadline
+ * before the write is issued, so it arrives here like the others.
+ */
+static boolean_t
+arc_presage_inherit(arc_buf_hdr_t *hdr)
+{
+	uint32_t expire;
+
+	ASSERT(MUTEX_HELD(HDR_LOCK(hdr)));
+	ASSERT3P(hdr->b_l1hdr.b_state, ==, arc_anon);
+	if (hdr->b_l1hdr.b_presage_expire == 0)
+		return (B_FALSE);
+	/*
+	 * Read the deadline and leave arc_anon as one step with respect to
+	 * arc_presage_forget(), which either lowers the deadline before it
+	 * is read here or finds the header in the presaged state after.
+	 */
+	rw_enter(&arc_presage_inherit_lock, RW_READER);
+	expire = hdr->b_l1hdr.b_presage_expire;
+	if (expire <= arc_presage_now() || !arc_presage_enabled() ||
+	    HDR_UNCACHED(hdr) ||
+	    arc_presage_hdr_charge(hdr) > arc_presage_room()) {
+		hdr->b_l1hdr.b_presage_expire = 0;
+		rw_exit(&arc_presage_inherit_lock);
+		return (B_FALSE);
+	}
+	hdr->b_l1hdr.b_arc_access = ddi_get_lbolt();
+	arc_change_state(arc_presaged, hdr);
+	rw_exit(&arc_presage_inherit_lock);
+	arc_presage_arm(expire);
+	ARCSTAT_BUMP(arcstat_presaged_inherited);
+	return (B_TRUE);
+}
+
+/*
+ * A write that changed nothing (a nopwrite, or a dedup write of data that
+ * is already in the ARC) completes with the block's header, exists, still
+ * in the hash table; the header that was written, hdr, stays anonymous and
+ * is thrown away.  If hdr carries a deadline it belongs to the block: the
+ * lookup in dbuf_write() took it from exists, expecting hdr to replace it.
+ * Give it back, with the checks arc_presage_inherit() makes.  Called under
+ * the hash lock of exists.
+ */
+static void
+arc_presage_readmit(arc_buf_hdr_t *exists, arc_buf_hdr_t *hdr)
+{
+	uint32_t expire;
+
+	ASSERT(MUTEX_HELD(HDR_LOCK(exists)));
+	if (hdr->b_l1hdr.b_presage_expire == 0)
+		return;
+	rw_enter(&arc_presage_inherit_lock, RW_READER);
+	expire = hdr->b_l1hdr.b_presage_expire;
+	hdr->b_l1hdr.b_presage_expire = 0;
+	rw_exit(&arc_presage_inherit_lock);
+	if (expire <= arc_presage_now() || !arc_presage_enabled() ||
+	    !HDR_HAS_L1HDR(exists) || HDR_IO_IN_PROGRESS(exists))
+		return;
+	if (exists->b_l1hdr.b_state == arc_presaged) {
+		exists->b_l1hdr.b_presage_expire =
+		    MAX(exists->b_l1hdr.b_presage_expire, expire);
+		return;
+	}
+	if ((exists->b_l1hdr.b_state != arc_mru &&
+	    exists->b_l1hdr.b_state != arc_mfu) || HDR_UNCACHED(exists) ||
+	    arc_presage_hdr_charge(exists) > arc_presage_room())
+		return;
+	exists->b_l1hdr.b_presage_expire = expire;
+	exists->b_l1hdr.b_arc_access = ddi_get_lbolt();
+	arc_change_state(arc_presaged, exists);
+	arc_presage_arm(expire);
+	ARCSTAT_BUMP(arcstat_presaged_inherited);
+}
+
+/*
+ * The lookup half of inheritance, for a buffer that did not come from
+ * arc_release() of the block it replaces: a whole-record write of a block
+ * whose dbuf had left the dbuf cache gets a fresh buffer (dbuf_noread()),
+ * so its header carries no deadline, while the old block's header may
+ * still sit in arc_presaged.  Called from dbuf_write() in syncing context
+ * with the block pointer being overwritten and the buffer about to be
+ * written, before the zio exists: one hash lookup under the old header's
+ * hash lock, and if that header is presaged with a deadline still ahead,
+ * the new header takes the deadline so that arc_write_done() admits it
+ * through arc_presage_inherit() with the same room and enabled checks,
+ * and the old header leaves the presaged state.
+ * Nothing is looked up while nothing is presaged.  The new header is anon
+ * and held by the caller; its field is written under the old header's hash
+ * lock, which is what orders this against a release (see below).
+ */
+void
+arc_presage_inherit_lookup(spa_t *spa, const blkptr_t *obp, arc_buf_t *buf)
+{
+	arc_buf_hdr_t *hdr = buf->b_hdr, *ohdr;
+	kmutex_t *hash_lock;
+	uint32_t expire = 0;
+
+	if (hdr->b_l1hdr.b_presage_expire != 0 || !arc_presage_enabled() ||
+	    arc_presage_size() == 0 || BP_IS_HOLE(obp) ||
+	    BP_IS_EMBEDDED(obp) || BP_IS_REDACTED(obp))
+		return;
+	ASSERT3P(hdr->b_l1hdr.b_state, ==, arc_anon);
+	ARCSTAT_BUMP(arcstat_presaged_lookups);
+	ohdr = buf_hash_find(spa_load_guid(spa), obp, &hash_lock);
+	if (ohdr == NULL)
+		return;
+	if (HDR_HAS_L1HDR(ohdr) && ohdr->b_l1hdr.b_state == arc_presaged) {
+		expire = ohdr->b_l1hdr.b_presage_expire;
+		/*
+		 * The deadline moves, it is not copied: the old copy is no
+		 * longer part of the file, and where a snapshot keeps the
+		 * block alive nothing else would take it out of the state
+		 * before its deadline.  (A clone or dedup sibling that
+		 * shares the block loses the hold with it.)  A held header
+		 * is demoted when its last hold drops.
+		 */
+		if (expire > arc_presage_now()) {
+			ohdr->b_l1hdr.b_presage_expire = arc_presage_now();
+			(void) arc_presage_demote_expired(ohdr);
+			/*
+			 * Hand the deadline over before the old header's
+			 * hash lock is dropped.  A release or replacement
+			 * looks the old block pointer up under this lock
+			 * and only then asks the dirty buffers what they
+			 * carry (dmu_presage_walk()), so it either finds
+			 * the old header still presaged, or finds the
+			 * deadline already in the new one.
+			 */
+			hdr->b_l1hdr.b_presage_expire = expire;
+			ARCSTAT_BUMP(arcstat_presaged_inherited_lookup);
+		}
+	}
+	mutex_exit(hash_lock);
+}
+
+/*
+ * A release (or a replacement with an earlier deadline) reaches the blocks
+ * of a file through the hash table by block pointer, and that misses a
+ * block that is being rewritten.  Until its write completes its header is
+ * anonymous, and it carries the old deadline back into the presaged state
+ * in arc_write_done().  A block written in open context (dmu_sync()) is in
+ * the hash table as soon as that write completes, but under a block
+ * pointer the file does not show until its transaction group is synced.
+ *
+ * The caller found buf attached to a dirty dbuf and holds the dbuf's
+ * mutex, so buf's header cannot be released under us.  Lower what the
+ * header carries or holds to deadline (0 for a release).  An anonymous
+ * header's field is read by arc_presage_inherit() and
+ * arc_presage_readmit(), which arc_presage_inherit_lock excludes here, and
+ * written by arc_presage_inherit_lookup() under the hash lock of the old
+ * copy's header, which the caller has dealt with before it calls this (see
+ * there).  A header that has left arc_anon is handled under its hash lock,
+ * taken after arc_presage_inherit_lock is dropped (the inheritor takes
+ * them in the other order).
+ */
+void
+arc_presage_forget(arc_buf_t *buf, uint32_t deadline)
+{
+	arc_buf_hdr_t *hdr = buf->b_hdr;
+	kmutex_t *hash_lock;
+
+	if (!HDR_HAS_L1HDR(hdr))
+		return;
+	rw_enter(&arc_presage_inherit_lock, RW_WRITER);
+	if (hdr->b_l1hdr.b_state == arc_anon) {
+		if (hdr->b_l1hdr.b_presage_expire > deadline)
+			hdr->b_l1hdr.b_presage_expire = deadline;
+		rw_exit(&arc_presage_inherit_lock);
+		return;
+	}
+	rw_exit(&arc_presage_inherit_lock);
+
+	hash_lock = HDR_LOCK(hdr);
+	mutex_enter(hash_lock);
+	if (hdr->b_l1hdr.b_state == arc_presaged &&
+	    hdr->b_l1hdr.b_presage_expire > deadline) {
+		if (deadline <= arc_presage_now()) {
+			hdr->b_l1hdr.b_presage_expire = arc_presage_now();
+			(void) arc_presage_demote_expired(hdr);
+		} else {
+			hdr->b_l1hdr.b_presage_expire = deadline;
+			arc_presage_arm(deadline);
+		}
+	}
+	mutex_exit(hash_lock);
+}
+
+/*
+ * Lower the deadline of a block that is presaged; never admit one.  A
+ * replacement with an earlier deadline uses this for the on-disk copy of
+ * a block whose dbuf is dirty: arc_presage_mark() must not touch that copy
+ * (it may no longer belong to the file), but if it is still presaged, the
+ * copy being written will take its deadline in arc_presage_inherit_lookup()
+ * and would carry the old one on.
+ */
+void
+arc_presage_lower(spa_t *spa, const blkptr_t *bp, uint32_t deadline)
+{
+	kmutex_t *hash_lock;
+	arc_buf_hdr_t *hdr;
+
+	if (BP_IS_HOLE(bp) || BP_IS_EMBEDDED(bp))
+		return;
+	hdr = buf_hash_find(spa_load_guid(spa), bp, &hash_lock);
+	if (hdr == NULL)
+		return;
+	if (HDR_HAS_L1HDR(hdr) && hdr->b_l1hdr.b_state == arc_presaged &&
+	    hdr->b_l1hdr.b_presage_expire > deadline) {
+		hdr->b_l1hdr.b_presage_expire = deadline;
+		arc_presage_arm(deadline);
+	}
+	mutex_exit(hash_lock);
+}
+
+/*
+ * Inheritance for a block whose new copy was written in open context
+ * (dmu_sync(), a clone), called from dbuf_write() when the transaction
+ * group that adopts the new block pointer is synced.  arc_write_done()
+ * could not do it: when that write completed the file still pointed at
+ * the old copy.  If the old copy is presaged its deadline moves to the new
+ * one, provided the new one is in the ARC (after dmu_sync() it is; after an
+ * O_DIRECT write it is not, and such a block waits for the next sweep).
+ * The old copy leaves the presaged state either way: it is no longer part
+ * of the file, and where a snapshot keeps the block nothing else would
+ * take it out before its deadline.
+ */
+void
+arc_presage_inherit_override(spa_t *spa, const blkptr_t *obp,
+    const blkptr_t *nbp)
+{
+	kmutex_t *hash_lock;
+	arc_buf_hdr_t *ohdr;
+	uint32_t expire = 0;
+	uint64_t marked = 0;
+
+	if (arc_presage_size() == 0 || BP_IS_HOLE(obp) ||
+	    BP_IS_EMBEDDED(obp) || BP_IS_REDACTED(obp))
+		return;
+	ohdr = buf_hash_find(spa_load_guid(spa), obp, &hash_lock);
+	if (ohdr == NULL)
+		return;
+	if (HDR_HAS_L1HDR(ohdr) && ohdr->b_l1hdr.b_state == arc_presaged) {
+		expire = ohdr->b_l1hdr.b_presage_expire;
+		ohdr->b_l1hdr.b_presage_expire = arc_presage_now();
+		(void) arc_presage_demote_expired(ohdr);
+	}
+	mutex_exit(hash_lock);
+	if (expire > arc_presage_now() && arc_presage_enabled() &&
+	    !BP_IS_HOLE(nbp) && !BP_IS_EMBEDDED(nbp) &&
+	    arc_presage_mark(spa, nbp, expire, 0, &marked) == 0 &&
+	    marked != 0)
+		ARCSTAT_BUMP(arcstat_presaged_inherited);
+}
+
 static boolean_t
 arc_evict_cb_check(void *arg, zthr_t *zthr)
 {
@@ -4888,6 +5631,9 @@ arc_evict_cb_check(void *arg, zthr_t *zthr)
 	if (arc_evict_needed)
 		return (B_TRUE);
 
+	if (arc_presage_reap_needed())
+		return (B_TRUE);
+
 	/*
 	 * If we have buffers in uncached state, evict them periodically.
 	 */
@@ -4907,6 +5653,9 @@ arc_evict_cb(void *arg, zthr_t *zthr)
 
 	uint64_t evicted = 0;
 	fstrans_cookie_t cookie = spl_fstrans_mark();
+
+	/* Demote expired / over-cap presage headers to MFU first. */
+	arc_presage_reap();
 
 	/* Always try to evict from uncached state. */
 	arc_last_uncached_flush = ddi_get_lbolt();
@@ -5308,6 +6057,8 @@ arc_get_data_impl(arc_buf_hdr_t *hdr, uint64_t size, const void *tag,
 
 		(void) zfs_refcount_add_many(&state->arcs_size[type], size,
 		    tag);
+		if (tag == hdr)
+			arc_presage_count(state, size);
 
 		/*
 		 * If this is reached via arc_read, the link is
@@ -5366,6 +6117,8 @@ arc_free_data_impl(arc_buf_hdr_t *hdr, uint64_t size, const void *tag)
 		    size, tag);
 	}
 	(void) zfs_refcount_remove_many(&state->arcs_size[type], size, tag);
+	if (tag == hdr)
+		arc_presage_count(state, -(int64_t)size);
 
 	VERIFY3U(hdr->b_type, ==, type);
 	if (type == ARC_BUFC_METADATA) {
@@ -5519,6 +6272,16 @@ arc_access(arc_buf_hdr_t *hdr, arc_flags_t arc_flags, boolean_t hit)
 		if (!HDR_IO_IN_PROGRESS(hdr))
 			ARCSTAT_BUMP(arcstat_uncached_hits);
 		hdr->b_l1hdr.b_arc_access = now;
+	} else if (hdr->b_l1hdr.b_state == arc_presaged) {
+		/*
+		 * User asked for this buffer to stay resident.  Record the
+		 * hit; the TTL, not access recency, decides when it leaves.
+		 * Past the deadline it is an ordinary MFU buffer again.
+		 */
+		if (!arc_presage_demote_expired(hdr) &&
+		    !HDR_IO_IN_PROGRESS(hdr))
+			ARCSTAT_BUMP(arcstat_presaged_hits);
+		hdr->b_l1hdr.b_arc_access = now;
 	} else if (hdr->b_l1hdr.b_state == arc_l2c_only) {
 		/*
 		 * This buffer is on the 2nd Level ARC and was not accessed
@@ -5561,7 +6324,8 @@ arc_buf_access(arc_buf_t *buf)
 
 	ASSERT(hdr->b_l1hdr.b_state == arc_mru ||
 	    hdr->b_l1hdr.b_state == arc_mfu ||
-	    hdr->b_l1hdr.b_state == arc_uncached);
+	    hdr->b_l1hdr.b_state == arc_uncached ||
+	    hdr->b_l1hdr.b_state == arc_presaged);
 
 	DTRACE_PROBE1(arc__hit, arc_buf_hdr_t *, hdr);
 	arc_access(hdr, 0, B_TRUE);
@@ -5871,6 +6635,13 @@ arc_cached(spa_t *spa, const blkptr_t *bp)
 			/* The header is still in L1, probably not for long */
 			flags |= ARC_CACHED_IN_L1;
 			break;
+		case ARC_STATE_PRESAGED:
+			if (arc_presage_demote_expired(hdr))
+				flags |= ARC_CACHED_IN_MFU | ARC_CACHED_IN_L1;
+			else
+				flags |= ARC_CACHED_IN_PRESAGED |
+				    ARC_CACHED_IN_L1;
+			break;
 		default:
 			break;
 		}
@@ -6061,7 +6832,8 @@ top:
 
 		ASSERT(hdr->b_l1hdr.b_state == arc_mru ||
 		    hdr->b_l1hdr.b_state == arc_mfu ||
-		    hdr->b_l1hdr.b_state == arc_uncached);
+		    hdr->b_l1hdr.b_state == arc_uncached ||
+		    hdr->b_l1hdr.b_state == arc_presaged);
 
 		DTRACE_PROBE1(arc__hit, arc_buf_hdr_t *, hdr);
 		arc_access(hdr, *arc_flags, B_TRUE);
@@ -7098,9 +7870,16 @@ arc_write_done(zio_t *zio)
 				ASSERT(BP_GET_DEDUP(zio->io_bp));
 				ASSERT0(BP_GET_LEVEL(zio->io_bp));
 			}
+			if (exists != NULL)
+				arc_presage_readmit(exists, hdr);
 		}
-		/* if it's not anon, we are doing a scrub */
-		if (exists == NULL && hdr->b_l1hdr.b_state == arc_anon)
+		/*
+		 * If it's not anon, we are doing a scrub.  An anon header
+		 * that carried a presage deadline through arc_release()
+		 * goes back to the presaged state; otherwise to MRU.
+		 */
+		if (exists == NULL && hdr->b_l1hdr.b_state == arc_anon &&
+		    !arc_presage_inherit(hdr))
 			arc_access(hdr, 0, B_FALSE);
 		arc_hdr_clear_flags(hdr, ARC_FLAG_IO_IN_PROGRESS);
 		VERIFY3S(remove_reference(hdr, hdr), >, 0);
@@ -7457,6 +8236,26 @@ arc_kstat_update(kstat_t *ksp, int rw)
 	    &as->arcstat_uncached_metadata,
 	    &as->arcstat_uncached_evictable_data,
 	    &as->arcstat_uncached_evictable_metadata);
+	arc_kstat_update_state(arc_presaged,
+	    &as->arcstat_presaged_size,
+	    &as->arcstat_presaged_data,
+	    &as->arcstat_presaged_metadata,
+	    &as->arcstat_presaged_evictable_data,
+	    &as->arcstat_presaged_evictable_metadata);
+	as->arcstat_presaged_counted.value.ui64 = arc_presage_counted();
+	as->arcstat_presaged_limit.value.ui64 = arc_presage_cap();
+	as->arcstat_presaged_hits.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_hits);
+	as->arcstat_presaged_expired.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_expired);
+	as->arcstat_presaged_demoted_cap.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_demoted_cap);
+	as->arcstat_presaged_inherited.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_inherited);
+	as->arcstat_presaged_lookups.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_lookups);
+	as->arcstat_presaged_inherited_lookup.value.ui64 =
+	    wmsum_value(&arc_sums.arcstat_presaged_inherited_lookup);
 
 	as->arcstat_dnode_size.value.ui64 =
 	    aggsum_value(&arc_sums.arcstat_dnode_size);
@@ -7740,6 +8539,10 @@ arc_state_init(void)
 	    arc_state_multilist_index_func, &num_sublists);
 	arc_state_multilist_init(&arc_uncached->arcs_list[ARC_BUFC_DATA],
 	    arc_state_multilist_index_func, &num_sublists);
+	arc_state_multilist_init(&arc_presaged->arcs_list[ARC_BUFC_METADATA],
+	    arc_state_multilist_index_func, &num_sublists);
+	arc_state_multilist_init(&arc_presaged->arcs_list[ARC_BUFC_DATA],
+	    arc_state_multilist_index_func, &num_sublists);
 
 	/*
 	 * L2 headers should never be on the L2 state list since they don't
@@ -7771,6 +8574,8 @@ arc_state_init(void)
 	zfs_refcount_create(&arc_l2c_only->arcs_esize[ARC_BUFC_DATA]);
 	zfs_refcount_create(&arc_uncached->arcs_esize[ARC_BUFC_METADATA]);
 	zfs_refcount_create(&arc_uncached->arcs_esize[ARC_BUFC_DATA]);
+	zfs_refcount_create(&arc_presaged->arcs_esize[ARC_BUFC_METADATA]);
+	zfs_refcount_create(&arc_presaged->arcs_esize[ARC_BUFC_DATA]);
 
 	zfs_refcount_create(&arc_anon->arcs_size[ARC_BUFC_DATA]);
 	zfs_refcount_create(&arc_anon->arcs_size[ARC_BUFC_METADATA]);
@@ -7786,6 +8591,8 @@ arc_state_init(void)
 	zfs_refcount_create(&arc_l2c_only->arcs_size[ARC_BUFC_METADATA]);
 	zfs_refcount_create(&arc_uncached->arcs_size[ARC_BUFC_DATA]);
 	zfs_refcount_create(&arc_uncached->arcs_size[ARC_BUFC_METADATA]);
+	zfs_refcount_create(&arc_presaged->arcs_size[ARC_BUFC_DATA]);
+	zfs_refcount_create(&arc_presaged->arcs_size[ARC_BUFC_METADATA]);
 
 	wmsum_init(&arc_mru_ghost->arcs_hits[ARC_BUFC_DATA], 0);
 	wmsum_init(&arc_mru_ghost->arcs_hits[ARC_BUFC_METADATA], 0);
@@ -7812,6 +8619,12 @@ arc_state_init(void)
 	wmsum_init(&arc_sums.arcstat_mfu_hits, 0);
 	wmsum_init(&arc_sums.arcstat_mfu_ghost_hits, 0);
 	wmsum_init(&arc_sums.arcstat_uncached_hits, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_hits, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_expired, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_demoted_cap, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_inherited, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_lookups, 0);
+	wmsum_init(&arc_sums.arcstat_presaged_inherited_lookup, 0);
 	wmsum_init(&arc_sums.arcstat_deleted, 0);
 	wmsum_init(&arc_sums.arcstat_mutex_miss, 0);
 	wmsum_init(&arc_sums.arcstat_access_skip, 0);
@@ -7898,6 +8711,7 @@ arc_state_init(void)
 	arc_mfu_ghost->arcs_state = ARC_STATE_MFU_GHOST;
 	arc_l2c_only->arcs_state = ARC_STATE_L2C_ONLY;
 	arc_uncached->arcs_state = ARC_STATE_UNCACHED;
+	arc_presaged->arcs_state = ARC_STATE_PRESAGED;
 }
 
 static void
@@ -7932,6 +8746,10 @@ arc_state_fini(void)
 	zfs_refcount_destroy(&arc_l2c_only->arcs_size[ARC_BUFC_METADATA]);
 	zfs_refcount_destroy(&arc_uncached->arcs_size[ARC_BUFC_DATA]);
 	zfs_refcount_destroy(&arc_uncached->arcs_size[ARC_BUFC_METADATA]);
+	zfs_refcount_destroy(&arc_presaged->arcs_size[ARC_BUFC_DATA]);
+	zfs_refcount_destroy(&arc_presaged->arcs_size[ARC_BUFC_METADATA]);
+	zfs_refcount_destroy(&arc_presaged->arcs_esize[ARC_BUFC_DATA]);
+	zfs_refcount_destroy(&arc_presaged->arcs_esize[ARC_BUFC_METADATA]);
 
 	multilist_destroy(&arc_mru->arcs_list[ARC_BUFC_METADATA]);
 	multilist_destroy(&arc_mru_ghost->arcs_list[ARC_BUFC_METADATA]);
@@ -7945,6 +8763,8 @@ arc_state_fini(void)
 	multilist_destroy(&arc_l2c_only->arcs_list[ARC_BUFC_DATA]);
 	multilist_destroy(&arc_uncached->arcs_list[ARC_BUFC_METADATA]);
 	multilist_destroy(&arc_uncached->arcs_list[ARC_BUFC_DATA]);
+	multilist_destroy(&arc_presaged->arcs_list[ARC_BUFC_METADATA]);
+	multilist_destroy(&arc_presaged->arcs_list[ARC_BUFC_DATA]);
 
 	wmsum_fini(&arc_mru_ghost->arcs_hits[ARC_BUFC_DATA]);
 	wmsum_fini(&arc_mru_ghost->arcs_hits[ARC_BUFC_METADATA]);
@@ -7971,6 +8791,12 @@ arc_state_fini(void)
 	wmsum_fini(&arc_sums.arcstat_mfu_hits);
 	wmsum_fini(&arc_sums.arcstat_mfu_ghost_hits);
 	wmsum_fini(&arc_sums.arcstat_uncached_hits);
+	wmsum_fini(&arc_sums.arcstat_presaged_hits);
+	wmsum_fini(&arc_sums.arcstat_presaged_expired);
+	wmsum_fini(&arc_sums.arcstat_presaged_demoted_cap);
+	wmsum_fini(&arc_sums.arcstat_presaged_inherited);
+	wmsum_fini(&arc_sums.arcstat_presaged_lookups);
+	wmsum_fini(&arc_sums.arcstat_presaged_inherited_lookup);
 	wmsum_fini(&arc_sums.arcstat_deleted);
 	wmsum_fini(&arc_sums.arcstat_mutex_miss);
 	wmsum_fini(&arc_sums.arcstat_access_skip);
@@ -8085,6 +8911,7 @@ arc_init(void)
 {
 	uint64_t percent, allmem = arc_all_memory();
 	mutex_init(&arc_evict_lock, NULL, MUTEX_DEFAULT, NULL);
+	rw_init(&arc_presage_inherit_lock, NULL, RW_DEFAULT, NULL);
 	list_create(&arc_evict_waiters, sizeof (arc_evict_waiter_t),
 	    offsetof(arc_evict_waiter_t, aew_node));
 
@@ -8274,6 +9101,7 @@ arc_fini(void)
 	}
 
 	mutex_destroy(&arc_evict_lock);
+	rw_destroy(&arc_presage_inherit_lock);
 	list_destroy(&arc_evict_waiters);
 
 	/*
@@ -11855,6 +12683,9 @@ ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, dnode_reduce_percent, UINT, ZMOD_RW,
 
 ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, eviction_pct, UINT, ZMOD_RW,
 	"When full, ARC allocation waits for eviction of this % of alloc size");
+
+ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, presaged_max_percent, UINT, ZMOD_RW,
+	"Max % of arc_c held in the presaged state, 0 disables");
 
 ZFS_MODULE_PARAM(zfs_arc, zfs_arc_, evict_batch_limit, UINT, ZMOD_RW,
 	"The number of headers to evict per sublist before moving to the next");
